@@ -2,7 +2,7 @@
 A股策略可视化仪表盘 v3 — 综合选股 + 进度动画 + 协调UI
 """
 import json, sys, os, time, threading, queue, re, itertools, io, base64
-from flask import Flask, Response, render_template_string, jsonify
+from flask import Flask, Response, render_template_string, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.db_manager as db_manager
 import core.scheduler as bg_scheduler
@@ -316,6 +316,140 @@ def api_chart(code):
         buf.seek(0)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         return jsonify({"image": "data:image/png;base64," + img_b64, "name": name, "code": code})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/kline/<code>")
+def api_kline(code):
+    """交互式K线数据: 返回 JSON 格式 OHLC + 均线 + MACD + RSI
+    支持 period 参数: minute(分时) | day(日K) | week(周K) | month(月K)
+    """
+    try:
+        period = request.args.get("period", "day")
+        category_map = {"minute": 0, "day": 4, "week": 5, "month": 6}
+        category = category_map.get(period, 4)
+        offset_map = {"minute": 240, "day": 120, "week": 80, "month": 60}
+        offset = offset_map.get(period, 120)
+
+        from mootdx.quotes import Quotes
+        import pandas as pd
+        import numpy as np
+
+        client = Quotes.factory(market='std')
+        bars = client.bars(symbol=code, category=category, offset=offset)
+
+        if bars is None or len(bars) < 10:
+            return jsonify({"error": "K线数据不足"}), 404
+
+        df = pd.DataFrame(bars)
+        # mootdx 返回的 bars 可能 datetime 同时是 index 和列，需要修复歧义
+        try:
+            dup_cols = set(df.index.names) & set(df.columns)
+            for col in dup_cols:
+                if col and col != '':
+                    df = df.drop(columns=[col])
+        except:
+            pass
+        # 确保 datetime 不是索引
+        if df.index.name == 'datetime' or 'datetime' in (df.index.names or []):
+            df = df.reset_index()
+        # 确保有 datetime 列
+        if 'datetime' not in df.columns:
+            for col in df.columns:
+                if 'datetime' in str(col).lower() or 'date' in str(col).lower():
+                    df = df.rename(columns={col: 'datetime'})
+                    break
+        if 'datetime' in df.columns:
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values('datetime')
+
+        # 分时数据字段可能不同
+        if period == "minute":
+            # 分时: 直接用 price/vol
+            prices = df['price'].astype(float).tolist()
+            vols = df['vol'].astype(float).tolist()
+            dates = df['datetime'].astype(str).tolist()
+            last_price = float(prices[-1]) if prices else 0
+            prev_close = float(bars.iloc[0].get('last_close', last_price)) if len(bars) > 0 else last_price
+            chg_pct = round((last_price / prev_close - 1) * 100, 2) if prev_close > 0 else 0
+
+            result = {
+                "code": code, "period": "minute",
+                "dates": dates, "prices": prices, "volumes": vols,
+                "last_price": last_price, "prev_close": prev_close,
+                "chg_pct": chg_pct,
+            }
+        else:
+            # K线数据
+            o = df['open'].astype(float)
+            h = df['high'].astype(float)
+            l = df['low'].astype(float)
+            c = df['close'].astype(float)
+            v = df['vol'].astype(float)
+            dates = df['datetime'].astype(str).tolist()
+
+            # 均线
+            ma5 = c.rolling(5).mean().round(2).tolist()
+            ma10 = c.rolling(10).mean().round(2).tolist()
+            ma20 = c.rolling(20).mean().round(2).tolist()
+            ma60 = c.rolling(60).mean().round(2).tolist()
+
+            # MACD
+            ema12 = c.ewm(span=12).mean()
+            ema26 = c.ewm(span=26).mean()
+            dif = (ema12 - ema26).round(3).tolist()
+            dea = dif.copy()
+            for i in range(9, len(dea)):
+                dea[i] = round(sum(dif[i-8:i+1]) / 9, 3)
+            macd_hist = [(dif[i] - dea[i]) * 2 for i in range(len(dif))]
+            macd_hist = [round(x, 3) for x in macd_hist]
+
+            # RSI14
+            delta = c.diff()
+            gain = delta.where(delta > 0, 0.0)
+            loss = (-delta).where(delta < 0, 0.0)
+            avg_gain = gain.rolling(14).mean()
+            avg_loss = loss.rolling(14).mean()
+            rs = avg_gain / avg_loss.replace(0, 1e-9)
+            rsi14 = (100 - (100 / (1 + rs))).round(1).tolist()
+
+            # KDJ
+            low_n = l.rolling(9).min()
+            high_n = h.rolling(9).max()
+            rsv = ((c - low_n) / (high_n - low_n).replace(0, 1)).clip(0, 1) * 100
+            k_val = rsv.ewm(com=2).mean().round(1).tolist()
+            d_val = pd.Series(k_val).ewm(com=2).mean().round(1).tolist()
+            j_val = [round(3 * k_val[i] - 2 * d_val[i], 1) for i in range(len(k_val))]
+
+            last_price = float(c.iloc[-1])
+            prev_close = float(c.iloc[-2]) if len(c) >= 2 else last_price
+            chg_pct = round((last_price / prev_close - 1) * 100, 2) if prev_close > 0 else 0
+
+            result = {
+                "code": code, "period": period,
+                "dates": dates,
+                "open": o.tolist(), "high": h.tolist(),
+                "low": l.tolist(), "close": c.tolist(),
+                "volume": v.tolist(),
+                "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
+                "dif": dif, "dea": dea, "macd_hist": macd_hist,
+                "rsi14": rsi14,
+                "k": k_val, "d": d_val, "j": j_val,
+                "last_price": last_price, "prev_close": prev_close,
+                "chg_pct": chg_pct,
+            }
+
+        # 获取股票名称
+        try:
+            from core.stock_utils import get_name_batch
+            nm = get_name_batch([code])
+            result["name"] = nm.get(code, code) if nm else code
+        except:
+            result["name"] = code
+
+        return jsonify(result)
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500

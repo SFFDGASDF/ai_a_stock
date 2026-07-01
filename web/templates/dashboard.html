@@ -1,4 +1,4 @@
-!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -138,8 +138,16 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 .opt-btn{padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:var(--text);cursor:pointer;font-size:11px;transition:all .2s;margin-right:6px}
 .opt-btn:hover{background:#1e3044;border-color:var(--accent)}
 .opt-btn.active-opt{background:rgba(72,219,251,.15);border-color:var(--accent);animation:glow 1.5s ease-in-out infinite}
-.sched-status{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--dim);padding:6px 0}</style>
-</head>
+.sched-status{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--dim);padding:6px 0}
+/* ---- K线图表 ---- */
+.chart-container{width:100%;height:520px}
+.chart-toolbar{display:flex;align-items:center;gap:6px;padding:6px 0}
+.chart-toolbar .cycle-btn{padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card2);color:var(--dim);cursor:pointer;font-size:11px;transition:all .2s}
+.chart-toolbar .cycle-btn:hover{color:#fff;border-color:var(--accent)}
+.chart-toolbar .cycle-btn.active{background:rgba(72,219,251,.2);border-color:var(--accent);color:#fff}
+.chart-loading{display:flex;align-items:center;justify-content:center;min-height:400px;color:var(--dim)}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <body>
 <div class="header">
   <h1><span>A股量化策略实时仪表盘</span> <span style="font-size:11px;color:var(--dim);font-weight:400">v3</span></h1>
@@ -556,59 +564,145 @@ function resetSingleBtns() {
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// ---- 股票快照K线图 ----
+// ---- ECharts 交互式K线图 ----
 var chartCache = {};
 var chartHoverTimer = null;
 var leaveTimer = null;
 var modalHovered = false;
+var klineChart = null;
+var klinePeriod = 'day';
+var klineCode = '';
 
 function openChart(code, name) {
   var modal = document.getElementById('chartModal');
-  // 如果当前modal已经显示同一只股票，不重复请求
-  var curCode = document.getElementById('modalTitle').getAttribute('data-chart-code');
-  if (curCode === code && modal.classList.contains('show')) return;
+  if (klineCode === code && modal.classList.contains('show')) return;
+
+  klineCode = code;
+  klinePeriod = 'day';
+  document.querySelectorAll('.cycle-btn').forEach(function(b){b.classList.remove('active')});
+  document.querySelector('.cycle-btn[data-period="day"]').classList.add('active');
 
   document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(name) + '<span class="m-code">' + code + '</span>';
-  document.getElementById('modalTitle').setAttribute('data-chart-code', code);
-  var img = document.getElementById('modalImg');
-  img.style.display = 'none';
-  img.classList.remove('loaded');
-  document.getElementById('modalLoader').style.display = '';
+  document.getElementById('chartContainer').style.display = 'none';
+  document.getElementById('chartLoader').style.display = '';
   document.getElementById('modalErr').style.display = 'none';
   modal.classList.add('show');
 
-  if (chartCache[code]) {
-    // 使用缓存
-    img.src = chartCache[code].image;
-    document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(chartCache[code].name) + '<span class="m-code">' + code + '</span>';
-    return;
-  }
+  loadKlineData(code, 'day');
+}
 
-  fetch('/api/chart/' + code)
-    .then(function(r){ if(!r.ok) return r.json().then(function(d){ throw new Error(d.error||'请求失败') }); return r.json(); })
-    .then(function(d){
-      chartCache[code] = d;
-      // 检查是否还在看同一只
-      if (document.getElementById('modalTitle').getAttribute('data-chart-code') === code) {
-        img.src = d.image;
-        document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(d.name) + '<span class="m-code">' + d.code + '</span>';
-      }
+function switchKlinePeriod(period) {
+  if (!klineCode) return;
+  document.querySelectorAll('.cycle-btn').forEach(function(b){b.classList.remove('active')});
+  document.querySelector('.cycle-btn[data-period="' + period + '"]').classList.add('active');
+  klinePeriod = period;
+  document.getElementById('chartContainer').style.display = 'none';
+  document.getElementById('chartLoader').style.display = '';
+  loadKlineData(klineCode, period);
+}
+
+function loadKlineData(code, period) {
+  var url = '/api/kline/' + code + '?period=' + period;
+  fetch(url).then(function(r){if(!r.ok)return r.json().then(function(d){throw new Error(d.error||'请求失败')});return r.json()})
+    .then(function(data){
+      renderKlineChart(data);
+      document.getElementById('chartLoader').style.display = 'none';
+      document.getElementById('chartContainer').style.display = '';
+      var info = document.getElementById('chartStockInfo');
+      var chgColor = data.chg_pct >= 0 ? 'var(--green)' : 'var(--red)';
+      info.innerHTML = '<span style="color:' + chgColor + '">' + (data.chg_pct>=0?'+':'') + data.chg_pct.toFixed(2) + '%</span>';
+      if (klineChart) klineChart.resize();
     }).catch(function(e){
-      document.getElementById('modalLoader').style.display = 'none';
+      document.getElementById('chartLoader').style.display = 'none';
       document.getElementById('modalErr').style.display = '';
-      document.getElementById('modalErr').textContent = '生成快照失败: ' + esc(e.message);
+      document.getElementById('modalErr').textContent = '加载失败: ' + esc(e.message);
     });
 }
 
-function closeModal() {
+function renderKlineChart(data) {
+  var dom = document.getElementById('chartContainer');
+  if (klineChart) { klineChart.dispose(); klineChart = null; }
+  klineChart = echarts.init(dom, 'dark');
+
+  var dates = data.dates;
+  var upColor = '#ef4444', downColor = '#22c55e';
+
+  if (data.period === 'minute') {
+    // 分时图
+    var option = {
+      backgroundColor: '#141e2a',
+      grid: [{left:'8%',right:'5%',top:20,height:'60%'},{left:'8%',right:'5%',top:'72%',height:'22%'}],
+      xAxis: [{type:'category',data:dates,axisLine:{lineStyle:{color:'#334'}},axisLabel:{fontSize:9,color:'#688'},gridIndex:0},
+              {type:'category',data:dates,axisLine:{lineStyle:{color:'#334'}},axisLabel:{show:false},gridIndex:1}],
+      yAxis: [{scale:true,splitLine:{lineStyle:{color:'rgba(255,255,255,.06)'}},axisLabel:{color:'#688'},gridIndex:0},
+              {scale:true,splitLine:{show:false},axisLabel:{color:'#688'},gridIndex:1}],
+      series: [
+        {name:'价格',type:'line',data:data.prices,smooth:true,symbol:'none',
+         lineStyle:{color:'#48dbfb',width:1.5},areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(72,219,251,.3)'},{offset:1,color:'rgba(72,219,251,0)'}])},xAxisIndex:0,yAxisIndex:0},
+        {name:'均价',type:'line',data:data.prices,smooth:true,symbol:'none',lineStyle:{color:'#feca57',width:1,type:'dashed'},xAxisIndex:0,yAxisIndex:0},
+        {name:'量',type:'bar',data:data.volumes,itemStyle:{color:'rgba(72,219,251,.3)'},xAxisIndex:1,yAxisIndex:1}
+      ],
+      tooltip:{trigger:'axis'},
+    };
+  } else {
+    var ohlc = [];
+    for (var i = 0; i < dates.length; i++) {
+      ohlc.push([data.open[i], data.close[i], data.low[i], data.high[i]]);
+    }
+
+    var option = {
+      backgroundColor: '#141e2a',
+      tooltip: {trigger:'axis',axisPointer:{type:'cross'}},
+      legend: {data:['K线','MA5','MA10','MA20','MA60'],bottom:0,textStyle:{color:'#688',fontSize:10}},
+      grid: [
+        {left:'8%',right:'5%',top:20,height:'42%'},
+        {left:'8%',right:'5%',top:'55%',height:'10%'},
+        {left:'8%',right:'5%',top:'70%',height:'12%'},
+        {left:'8%',right:'5%',top:'86%',height:'10%'}
+      ],
+      xAxis: [
+        {type:'category',data:dates,gridIndex:0,axisLine:{lineStyle:{color:'#334'}},axisLabel:{fontSize:9,color:'#688'}},
+        {type:'category',data:dates,gridIndex:1,axisLabel:{show:false},axisLine:{lineStyle:{color:'#334'}}},
+        {type:'category',data:dates,gridIndex:2,axisLabel:{show:false},axisLine:{lineStyle:{color:'#334'}}},
+        {type:'category',data:dates,gridIndex:3,axisLabel:{fontSize:8,color:'#688'},axisLine:{lineStyle:{color:'#334'}}}
+      ],
+      yAxis: [
+        {scale:true,splitArea:{show:true,areaStyle:{color:['rgba(255,255,255,.02)','rgba(255,255,255,.05)']}},splitLine:{lineStyle:{color:'rgba(255,255,255,.06)'}},axisLabel:{color:'#688'},gridIndex:0},
+        {scale:true,splitLine:{show:false},axisLabel:{show:false},gridIndex:1},
+        {scale:true,splitLine:{lineStyle:{color:'rgba(255,255,255,.06)'}},axisLabel:{color:'#688',fontSize:9},gridIndex:2},
+        {scale:true,splitLine:{lineStyle:{color:'rgba(255,255,255,.06)'}},axisLabel:{color:'#688',fontSize:8},min:0,max:100,gridIndex:3}
+      ],
+      dataZoom: [{type:'inside',xAxisIndex:[0,1,2,3]}],
+      series: [
+        {name:'K线',type:'candlestick',data:ohlc,xAxisIndex:0,yAxisIndex:0,
+         itemStyle:{color:upColor,color0:downColor,borderColor:upColor,borderColor0:downColor}},
+        {name:'MA5',type:'line',data:data.ma5,smooth:true,symbol:'none',lineStyle:{width:1,color:'#f59e0b'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA10',type:'line',data:data.ma10,smooth:true,symbol:'none',lineStyle:{width:1,color:'#3b82f6'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA20',type:'line',data:data.ma20,smooth:true,symbol:'none',lineStyle:{width:1,color:'#a855f7'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA60',type:'line',data:data.ma60,smooth:true,symbol:'none',lineStyle:{width:1,color:'#ec4899'},xAxisIndex:0,yAxisIndex:0},
+        {name:'成交量',type:'bar',data:data.volume,xAxisIndex:1,yAxisIndex:1,
+         itemStyle:{color:function(p){var i=p.dataIndex;return data.close[i]>=data.open[i]?upColor:downColor},opacity:0.4}},
+        {name:'MACD',type:'bar',data:data.macd_hist,xAxisIndex:2,yAxisIndex:2,
+         itemStyle:{color:function(p){return data.macd_hist[p.dataIndex]>=0?upColor:downColor},opacity:0.7}},
+        {name:'DIF',type:'line',data:data.dif,smooth:true,symbol:'none',lineStyle:{width:1,color:'#fff'},xAxisIndex:2,yAxisIndex:2},
+        {name:'DEA',type:'line',data:data.dea,smooth:true,symbol:'none',lineStyle:{width:1,color:'#feca57'},xAxisIndex:2,yAxisIndex:2},
+        {name:'RSI14',type:'line',data:data.rsi14,smooth:true,symbol:'none',lineStyle:{width:1,color:'#48dbfb'},xAxisIndex:3,yAxisIndex:3,
+         markLine:{silent:true,data:[{yAxis:70,lineStyle:{color:'#ef4444',width:1,type:'dashed'}},{yAxis:30,lineStyle:{color:'#22c55e',width:1,type:'dashed'}}]}}
+      ]
+    };
+  }
+
+  klineChart.setOption(option);
+  window.addEventListener('resize', function(){if(klineChart)klineChart.resize();});
+}
+
+function closeChartModal() {
   var modal = document.getElementById('chartModal');
   modal.classList.remove('show');
-  // 延迟清理图片src，让关闭动画先播放
-  setTimeout(function() {
-    if (!modal.classList.contains('show')) {
-      document.getElementById('modalImg').src = '';
-      document.getElementById('modalImg').classList.remove('loaded');
-      document.getElementById('modalTitle').removeAttribute('data-chart-code');
+  setTimeout(function(){
+    if (!modal.classList.contains('show') && klineChart) {
+      klineChart.dispose(); klineChart = null;
+      document.getElementById('chartContainer').style.display = 'none';
     }
   }, 450);
 }
@@ -831,16 +925,24 @@ function optimizeNow() {
     loadSchedStatus();
   }).catch(function(e) { alert('优化失败: ' + e); });
 }</script>
-<!-- 模态弹窗 -->
-<div class="modal-overlay" id="chartModal" onclick="if(event.target===this)closeModal()"
+<!-- 模态弹窗 - ECharts 交互式K线 -->
+<div class="modal-overlay" id="chartModal" onclick="if(event.target===this)closeChartModal()"
     onmouseenter="modalHovered=true;clearTimeout(leaveTimer)"
-    onmouseleave="modalHovered=false;leaveTimer=setTimeout(function(){if(!modalHovered)closeModal()},250)">
+    onmouseleave="modalHovered=false;leaveTimer=setTimeout(function(){if(!modalHovered)closeChartModal()},250)">
   <div class="modal-box">
-    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <button class="modal-close" onclick="closeChartModal()">&times;</button>
     <div class="modal-title" id="modalTitle"></div>
     <div class="modal-content">
-      <div class="modal-loader" id="modalLoader"><div class="modal-spinner"></div></div>
-      <img class="modal-chart-img" id="modalImg" alt="K线图" style="display:none" onload="this.style.display='block';this.classList.add('loaded');document.getElementById('modalLoader').style.display='none'">
+      <div class="chart-toolbar">
+        <button class="cycle-btn" data-period="minute" onclick="switchKlinePeriod('minute')">分时</button>
+        <button class="cycle-btn active" data-period="day" onclick="switchKlinePeriod('day')">日K</button>
+        <button class="cycle-btn" data-period="week" onclick="switchKlinePeriod('week')">周K</button>
+        <button class="cycle-btn" data-period="month" onclick="switchKlinePeriod('month')">月K</button>
+        <span style="flex:1"></span>
+        <span id="chartStockInfo" style="font-size:12px;color:var(--text)"></span>
+      </div>
+      <div class="chart-loading" id="chartLoader"><div class="modal-spinner"></div></div>
+      <div class="chart-container" id="chartContainer" style="display:none"></div>
       <div class="modal-error" id="modalErr" style="display:none"></div>
     </div>
   </div>
