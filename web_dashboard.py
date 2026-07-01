@@ -1,0 +1,669 @@
+"""
+A股策略可视化仪表盘 v3 — 综合选股 + 进度动画 + 协调UI
+"""
+import json, sys, os, time, threading, subprocess, re, itertools
+from flask import Flask, Response, render_template_string, jsonify
+
+app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STRATEGIES_DIR = os.path.join(BASE_DIR, "strategies")
+
+STRATEGIES = {
+    "momentum":    {"name": "动量策略", "file": "momentum_v4.py",    "icon": "\U0001f680", "color": "#ff6b6b"},
+    "oversold":    {"name": "超跌反弹", "file": "oversold_v4.py",    "icon": "\U0001f4c9", "color": "#48dbfb"},
+    "volume_price":{"name": "量价共振", "file": "volume_price_resonance_v4.py", "icon": "\U0001f4ca", "color": "#feca57"},
+    "breakout":    {"name": "均线突破", "file": "breakout_strategy.py","icon": "\U0001f53a", "color": "#00d2a0"},
+}
+
+ALL_ORDER = ["momentum", "oversold", "volume_price", "breakout"]
+_run_status = {}
+_run_lock = threading.Lock()
+
+
+def parse_strategy_output(lines):
+    result = {"market_env": "", "sentiment": "", "stocks": [], "recommendation": None}
+    stock_re = re.compile(r"#(\d+)\s+(.+?)\((\d{6})\)\s+([\d.]+)\s+今日([+-][\d.]+)%\s+评分(\d+)")
+
+    for line in lines:
+        ls = line.strip()
+        if not ls: continue
+        if "大盘:" in ls and "情绪:" in ls: result["market_env"] = ls
+        if "涨停" in ls and ("炸板率" in ls or "温度" in ls): result["sentiment"] = ls
+        if "最终推荐:" in ls:
+            m = re.search(r"最终推荐:\s*(.+?)\((\d{6})\)\s*(\d+)/100", ls)
+            if m: result["recommendation"] = {"name": m.group(1), "code": m.group(2), "score": int(m.group(3))}
+        if result["recommendation"]:
+            rc = result["recommendation"]
+            for pat, key in [(r"现价:\s*([\d.]+)","price"),(r"今日涨幅:\s*([+-][\d.]+)%","chg"),
+                             (r"今日跌幅:\s*([-][\d.]+)%","chg"),
+                             (r"换手率:\s*([\d.]+)%","turnover"),(r"RPS20:\s*([\d.]+)","rps20"),
+                             (r"PE:\s*([\d.]+)","pe")]:
+                m = re.search(pat, ls)
+                if m: rc[key] = float(m.group(1))
+            m = re.search(r"目标:\s*([\d.]+).*?([\d.]+)", ls)
+            if m: rc["target_low"] = float(m.group(1)); rc["target_high"] = float(m.group(2))
+            m = re.search(r"止损:\s*([\d.]+)", ls)
+            if m: rc["stop_price"] = float(m.group(1))
+
+        sm = stock_re.match(ls)
+        if sm:
+            result["stocks"].append({"rank":int(sm.group(1)),"name":sm.group(2).strip(),
+                "code":sm.group(3),"price":float(sm.group(4)),"chg":float(sm.group(5)),
+                "score":int(sm.group(6)),"source":""})
+        elif result["stocks"] and any(kw in ls for kw in ["RSI","量比","换手","RPS","PE","BOLL","大单","涨停基因","乖离","下影","MA5","MA20","MACD"]):
+            last = result["stocks"][-1]
+            for pat, key in [(r"RSI6=([\d.]+)","rsi6"),(r"RSI14=([\d.]+)","rsi14"),
+                             (r"量比=([\d.]+)x","volume_ratio"),(r"换手=([\d.]+)%","turnover"),
+                             (r"RPS20=([\d.]+)","rps20"),(r"乖离=([\d.]+)%","deviation"),
+                             (r"涨停基因=(\d+)次","limit_up_count"),(r"PE=([\d.]+)","pe"),
+                             (r"BOLL=([\d.]+)%","boll_pos")]:
+                m2 = re.search(pat, ls)
+                if m2: last[key] = float(m2.group(1))
+            m3 = re.search(r"大单=(\d+)万", ls)
+            if m3: last["main_net"] = float(m3.group(1))
+    return result
+
+
+def run_strategy_stream(strategy_key):
+    info = STRATEGIES[strategy_key]
+    script = os.path.join(STRATEGIES_DIR, info["file"])
+    with _run_lock: _run_status[strategy_key] = {"running":True,"progress":0,"done":False}
+    def emit(etype,**kw): return f"data: {json.dumps(dict(type=etype,**kw),ensure_ascii=False)}\n\n"
+    try:
+        env = os.environ.copy(); env["PYTHONUNBUFFERED"]="1"; env["PYTHONIOENCODING"]="utf-8"
+        proc = subprocess.Popen([sys.executable,"-X","utf8",script],cwd=BASE_DIR,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env)
+        all_lines = []; last_p = 0
+        for raw in proc.stdout:
+            try: line = raw.decode("utf-8",errors="replace").rstrip("\r\n")
+            except: line = raw.decode("gbk",errors="replace").rstrip("\r\n")
+            all_lines.append(line)
+            progress = last_p
+            if "[0/7]" in line: progress = 5
+            elif "[1/7]" in line: progress = 10
+            elif "[2/7]" in line: progress = 20
+            elif "[3/7]" in line: progress = 30
+            elif "[4/7]" in line: progress = 45
+            elif "[5/7]" in line: progress = 60
+            elif "[6/7]" in line: progress = 80
+            elif "[7/7]" in line: progress = 90
+            elif "最终推荐" in line: progress = 95
+            elif "以上为技术面分析" in line: progress = 100
+            if progress > last_p: last_p = progress
+            with _run_lock: _run_status[strategy_key] = {"running":True,"progress":progress,"done":False}
+            yield emit("log", line=line, progress=progress)
+        proc.wait()
+        result = parse_strategy_output(all_lines)
+        with _run_lock: _run_status[strategy_key] = {"running":False,"progress":100,"done":True,"result":result}
+        yield emit("done", result=result)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        yield emit("error", msg=str(e))
+        with _run_lock: _run_status[strategy_key] = {"running":False,"progress":0,"done":True,"error":str(e)}
+
+
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML, strategies=STRATEGIES, all_order=ALL_ORDER)
+
+
+@app.route("/api/run/<strategy_key>")
+def api_run(strategy_key):
+    if strategy_key not in STRATEGIES: return jsonify({"error":"unknown"}), 404
+    return Response(run_strategy_stream(strategy_key), mimetype="text/event-stream; charset=utf-8",
+        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"})
+
+
+@app.route("/api/run-all")
+def api_run_all():
+    """综合选股: 顺序运行全部4个策略, 合并结果"""
+    def generate():
+        merged = {"stocks": [], "recommendations": [], "market_env": "", "sentiment": "", "total": 4, "done_count": 0}
+        yield f"data: {json.dumps({'type':'all_start','total':4},ensure_ascii=False)}\n\n"
+        for idx, key in enumerate(ALL_ORDER):
+            info = STRATEGIES[key]
+            yield f"data: {json.dumps({'type':'strategy_start','key':key,'name':info['name'],'icon':info['icon'],'color':info['color'],'idx':idx+1,'total':4},ensure_ascii=False)}\n\n"
+            for chunk in run_strategy_stream(key):
+                if chunk.startswith("data: "):
+                    try:
+                        data = json.loads(chunk[6:])
+                        if data.get("type") == "log":
+                            yield f"data: {json.dumps({'type':'all_log','key':key,'line':data['line'],'progress':data['progress']},ensure_ascii=False)}\n\n"
+                        elif data.get("type") == "done":
+                            r = data.get("result", {})
+                            merged["market_env"] = r.get("market_env") or merged["market_env"]
+                            merged["sentiment"] = r.get("sentiment") or merged["sentiment"]
+                            # 标记来源并合并
+                            for s in r.get("stocks", []):
+                                s["source"] = info["icon"] + " " + info["name"]
+                            merged["stocks"].extend(r.get("stocks", []))
+                            if r.get("recommendation"):
+                                r["recommendation"]["source_key"] = key
+                                r["recommendation"]["source_name"] = info["name"]
+                                r["recommendation"]["source_icon"] = info["icon"]
+                                merged["recommendations"].append(r["recommendation"])
+                            merged["done_count"] = idx + 1
+                            yield f"data: {json.dumps({'type':'strategy_done','key':key,'done_count':idx+1,'total':4},ensure_ascii=False)}\n\n"
+                    except: pass
+        # 去重、排序合并结果
+        seen = set()
+        uniq_stocks = []
+        for s in merged["stocks"]:
+            if s["code"] not in seen:
+                seen.add(s["code"])
+                uniq_stocks.append(s)
+        uniq_stocks.sort(key=lambda x: x["score"], reverse=True)
+        merged["stocks"] = uniq_stocks[:60]
+        merged["recommendations"].sort(key=lambda x: x["score"], reverse=True)
+        merged["all_done"] = True
+        yield f"data: {json.dumps({'type':'all_done','result':merged},ensure_ascii=False)}\n\n"
+    return Response(generate(), mimetype="text/event-stream; charset=utf-8",
+        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"})
+
+
+# ============================================================
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>A股策略仪表盘 v3</title>
+<style>
+:root{--bg:#0d1520;--card:#141e2a;--card2:#1a2838;--border:#233044;--text:#bcc8d6;--dim:#5a6d80;--accent:#48dbfb;--green:#00d2a0;--red:#ff6b6b;--yellow:#feca57}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
+.header{background:linear-gradient(135deg,#111d2b,#0a121c);padding:12px 28px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1e2d3e;z-index:10}
+.header h1{font-size:17px;font-weight:700;letter-spacing:.5px}
+.header h1 span{background:linear-gradient(90deg,#ff6b6b,#feca57,#48dbfb);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header .status-bar{display:flex;align-items:center;gap:18px;font-size:11px;color:var(--dim)}
+.header .status-item{display:flex;align-items:center;gap:5px}
+.layout{display:flex;gap:12px;padding:12px;height:calc(100vh - 56px)}
+.left{flex:0 0 340px;display:flex;flex-direction:column;gap:10px}
+.right{flex:1;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card{background:var(--card);border-radius:10px;padding:14px;border:1px solid var(--border);transition:border-color .3s,box-shadow .3s}
+.card:hover{border-color:#3a5068;box-shadow:0 4px 20px rgba(0,0,0,.25)}
+.card-title{font-size:12px;font-weight:700;color:var(--dim);margin-bottom:10px;letter-spacing:1.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.card-title::after{content:'';flex:1;height:1px;background:var(--border);opacity:.5}
+.strategy-btn{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--text);cursor:pointer;font-size:12px;transition:all .25s;text-align:left;position:relative;overflow:hidden}
+.strategy-btn::after{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:0 3px 3px 0;transition:background .3s}
+.strategy-btn:hover{background:#1e3044;border-color:#3a5a7a;transform:translateX(3px)}
+.strategy-btn.running{background:rgba(255,107,107,.1);border-color:var(--red);animation:glow 1.5s ease-in-out infinite}
+.strategy-btn.running::after{background:var(--red)}
+@keyframes glow{0%,100%{box-shadow:0 0 8px rgba(255,107,107,0)}50%{box-shadow:0 0 16px rgba(255,107,107,.25)}}
+.strategy-btn .s-icon{font-size:20px;min-width:28px;text-align:center}
+.strategy-btn .s-info{flex:1;min-width:0}
+.strategy-btn .s-name{font-weight:700;font-size:13px}
+.strategy-btn .s-desc{font-size:10px;color:var(--dim);margin-top:1px}
+.progress-wrap{height:3px;background:var(--border);border-radius:0 0 3px 3px;margin-top:-1px;overflow:hidden}
+.progress-fill{height:100%;border-radius:2px;transition:width .4s cubic-bezier(.4,0,.2,1);width:0%}
+.progress-fill.momentum{background:linear-gradient(90deg,#ff6b6b,#ff8a8a)}
+.progress-fill.oversold{background:linear-gradient(90deg,#48dbfb,#7ae0ff)}
+.progress-fill.volume_price{background:linear-gradient(90deg,#feca57,#ffe08a)}
+.progress-fill.breakout{background:linear-gradient(90deg,#00d2a0,#2effc2)}
+.log-panel{flex:1;overflow-y:auto;font-family:'Consolas','Cascadia Code',monospace;font-size:10.5px;line-height:1.45;color:#6a7d90;min-height:150px;max-height:320px;background:rgba(0,0,0,.2);border-radius:8px;padding:10px}
+.log-panel div{padding:1px 0;white-space:pre-wrap;word-break:break-all}
+.log-panel .st{color:var(--yellow)}
+.log-panel .ok{color:var(--green)}
+.log-panel .err{color:var(--red)}
+.all-btn{width:100%;padding:12px;border-radius:10px;border:none;background:linear-gradient(135deg,#ff6b6b,#feca57,#48dbfb,#00d2a0);color:#0d1520;font-size:14px;font-weight:800;cursor:pointer;letter-spacing:2px;transition:all .3s;position:relative;overflow:hidden;margin-bottom:6px}
+.all-btn:hover{transform:scale(1.02);box-shadow:0 6px 30px rgba(72,219,251,.3)}
+.all-btn:active{transform:scale(.98)}
+.all-btn.running{animation:allGlow 1.2s ease-in-out infinite;pointer-events:none}
+@keyframes allGlow{0%,100%{box-shadow:0 0 20px rgba(255,107,107,.4)}25%{box-shadow:0 0 25px rgba(254,202,87,.4)}50%{box-shadow:0 0 25px rgba(72,219,251,.4)}75%{box-shadow:0 0 20px rgba(0,210,160,.4)}}
+/* ---- 精致 K 线动画 ---- */
+.chart-hero{display:flex;align-items:center;justify-content:center;flex-direction:column;position:relative;width:100%;height:100%;overflow:hidden}
+.chart-box{position:relative;width:540px;height:200px}
+.chart-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(35,48,68,.25) 1px,transparent 1px),linear-gradient(90deg,rgba(35,48,68,.25) 1px,transparent 1px);background-size:36px 36px;border-radius:4px}
+.chart-glow{position:absolute;left:20%;right:30%;top:15%;bottom:25%;background:radial-gradient(ellipse,rgba(0,210,160,.06),transparent 70%);pointer-events:none;animation:glowBreath 3s ease-in-out infinite}
+@keyframes glowBreath{0%,100%{opacity:.4}50%{opacity:1}}
+.candles-wrap{position:absolute;left:24px;right:42px;bottom:28px;top:8px;display:flex;align-items:flex-end;justify-content:space-around}
+.candle{display:flex;flex-direction:column;align-items:center;animation:candlePop .5s cubic-bezier(.34,1.56,.64,1) both}
+.candle .wick{width:1px;flex-shrink:0;background:currentColor;border-radius:1px}
+.candle .body{width:7px;border-radius:2px;min-height:3px;position:relative;transition:filter .3s}
+.candle .body::after{content:'';position:absolute;inset:-2px -3px;border-radius:4px;opacity:0;transition:opacity .3s}
+.candle:hover .body::after{opacity:.3}
+.candle.up{color:var(--green)}.candle.up .body{background:var(--green)}.candle.up .body::after{background:var(--green)}
+.candle.dn{color:var(--red)}.candle.dn .body{background:var(--red)}.candle.dn .body::after{background:var(--red)}
+@keyframes candlePop{0%{opacity:0;transform:translateY(30px) scaleY(0)}60%{opacity:1;transform:translateY(-2px) scaleY(1.05)}100%{opacity:1;transform:translateY(0) scaleY(1)}}
+.ma-line{position:absolute;left:24px;right:42px;bottom:28px;top:8px;pointer-events:none}
+.ma-line svg{width:100%;height:100%}
+.ma-line path{fill:none;stroke:var(--accent);stroke-width:2;stroke-dasharray:800;stroke-dashoffset:800;animation:drawMA 1.8s .6s ease forwards;filter:drop-shadow(0 0 5px rgba(72,219,251,.6))}
+@keyframes drawMA{to{stroke-dashoffset:0}}
+.pulse-dot{position:absolute;width:7px;height:7px;background:var(--accent);border-radius:50%;box-shadow:0 0 12px var(--accent);animation:dotTravel 4s ease-in-out infinite;pointer-events:none}
+@keyframes dotTravel{0%{left:18%;top:70%}25%{left:35%;top:55%}50%{left:55%;top:43%}75%{left:75%;top:35%}100%{left:18%;top:70%}}
+.price-ticker{position:absolute;right:6px;top:6px;font-family:'Consolas',monospace;font-size:20px;font-weight:700;display:flex;align-items:center;gap:4px}
+.price-ticker .tick-num{color:var(--green);animation:priceGlow 2s ease-in-out infinite}
+.price-ticker .tick-pct{font-size:11px;padding:2px 6px;border-radius:4px;background:rgba(0,210,160,.15);color:var(--green)}
+@keyframes priceGlow{0%,100%{text-shadow:0 0 6px rgba(0,210,160,.3)}50%{text-shadow:0 0 18px rgba(0,210,160,.7)}}
+.particle{position:absolute;font-family:'Consolas',monospace;font-size:9px;pointer-events:none;animation:floatUp 2.8s ease-out forwards;white-space:nowrap}
+.particle.p-up{color:var(--green)}.particle.p-dn{color:var(--red)}
+@keyframes floatUp{0%{opacity:1;transform:translateY(0) scale(1)}70%{opacity:.6}100%{opacity:0;transform:translateY(-140px) scale(.4)}}
+.hero-title{font-size:15px;font-weight:700;color:var(--text);margin-bottom:4px}
+.hero-desc{font-size:11px;color:var(--dim)}
+.candle-label{position:absolute;bottom:6px;left:30px;right:46px;display:flex;justify-content:space-around;font-size:8px;color:rgba(90,109,128,.4)}
+.rec-card{background:linear-gradient(135deg,rgba(255,107,107,.12),rgba(254,202,87,.08),rgba(72,219,251,.06));border:1px solid rgba(255,107,107,.3);border-radius:12px;padding:18px;margin-bottom:10px;animation:fadeIn .5s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.rec-card .rec-top{display:flex;justify-content:space-between;align-items:flex-start}
+.rec-card .rec-name{font-size:22px;font-weight:700;color:#fff}
+.rec-card .rec-code{font-size:12px;color:var(--dim)}
+.rec-card .rec-price{font-size:32px;font-weight:700;color:var(--green);margin:6px 0;display:flex;align-items:baseline;gap:8px}
+.rec-card .rec-chg{font-size:15px}
+.rec-card .rec-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:10px}
+.rec-card .rec-metric{background:rgba(0,0,0,.25);padding:8px 10px;border-radius:6px;font-size:11px}
+.rec-card .rec-metric label{color:var(--dim);display:block;font-size:9px;margin-bottom:2px}
+.rec-card .rec-metric value{color:var(--text);font-weight:600}
+.stock-table{width:100%;border-collapse:collapse;font-size:12px}
+.stock-table th{text-align:left;padding:7px 8px;color:var(--dim);font-weight:600;font-size:10px;border-bottom:2px solid var(--border);position:sticky;top:0;background:var(--card)}
+.stock-table td{padding:8px;border-bottom:1px solid rgba(35,48,68,.5);transition:background .15s}
+.stock-table tbody tr{transition:all .2s}
+.stock-table tbody tr:hover{background:rgba(72,219,251,.06);transform:scale(1.003)}
+.up{color:var(--green)}.down{color:var(--red)}
+.source-tag{display:inline-block;font-size:9px;padding:2px 6px;border-radius:10px;background:rgba(72,219,251,.12);margin-left:4px}
+.tab-row{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
+.tab{padding:6px 14px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--dim);cursor:pointer;font-size:11px;transition:all .25s;font-weight:600}
+.tab.active{background:rgba(72,219,251,.15);border-color:var(--accent);color:#fff}
+.tab.all-tab{background:rgba(254,202,87,.1);border-color:var(--yellow);color:var(--yellow)}
+.tab.all-tab.active{background:rgba(254,202,87,.25);color:#fff}
+.badge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;border-radius:9px;font-size:10px;font-weight:700;background:var(--accent);color:#000;margin-left:4px;padding:0 5px}
+.scroll-box{overflow-y:auto;flex:1;min-height:0}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span>A股量化策略实时仪表盘</span> <span style="font-size:11px;color:var(--dim);font-weight:400">v3</span></h1>
+  <div class="status-bar">
+    <div class="status-item">&#x1f4c5; <span id="clock">--</span></div>
+    <div class="status-item" id="sysStatus">&#x25cf; 就绪</div>
+  </div>
+</div>
+
+<div class="layout">
+  <!-- 左侧 -->
+  <div class="left">
+    <!-- 综合选股 -->
+    <button class="all-btn" id="allBtn" onclick="runAll()">
+      &#x1f30d; 综合选股 · 四策略一键运行
+    </button>
+
+    <!-- 策略列表 -->
+    <div class="card">
+      <div class="card-title">单策略运行</div>
+      {% for key in all_order %}
+      {% set info = strategies[key] %}
+      <div style="margin-bottom:6px">
+        <button class="strategy-btn" id="btn-{{key}}" onclick="runSingle('{{key}}')">
+          <span class="s-icon">{{info['icon']}}</span>
+          <div class="s-info">
+            <div class="s-name">{{info['name']}}</div>
+            <div class="s-desc">{{info['file']}}</div>
+          </div>
+        </button>
+        <div class="progress-wrap" style="display:none" id="pwrap-{{key}}">
+          <div class="progress-fill {{key}}" id="pbar-{{key}}"></div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- 实时日志 -->
+    <div class="card" style="flex:1;display:flex;flex-direction:column">
+      <div class="card-title">&#x1f4dc; 实时日志</div>
+      <div class="log-panel" id="logPanel">
+        <div style="text-align:center;padding:30px;color:var(--dim)">
+          <div style="font-size:36px;margin-bottom:8px">&#x1f3af;</div>
+          <div>点击「综合选股」一键分析全市场</div>
+          <div style="font-size:10px;margin-top:4px">或单独运行下方策略</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右侧 -->
+  <div class="right">
+    <!-- 推荐卡片 -->
+    <div id="recCardWrap" style="display:none"></div>
+
+    <!-- 主内容区 -->
+    <div class="card" style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+      <div class="tab-row" id="tabRow"></div>
+      <div class="scroll-box" style="overflow-x:auto">
+        <!-- 精致 K 线动画 -->
+        <div class="chart-hero" id="rightHero">
+          <div class="chart-box" id="chartBox">
+            <div class="chart-grid"></div>
+            <div class="chart-glow"></div>
+            <div class="candles-wrap" id="candlesWrap"></div>
+            <div class="ma-line">
+              <svg viewBox="0 0 500 160" preserveAspectRatio="none">
+                <path d="M0,148 Q30,142 60,128 T120,105 T180,88 T240,72 T300,58 T360,50 T420,45 T500,42" id="maPath"/>
+              </svg>
+            </div>
+            <div class="pulse-dot" id="pulseDot"></div>
+            <div class="price-ticker">
+              <span class="tick-num" id="tickNum">3,286.52</span>
+              <span class="tick-pct" id="tickPct">+1.28%</span>
+            </div>
+            <div class="candle-label" id="candleLabel"></div>
+          </div>
+          <div style="margin-top:12px;text-align:center">
+            <div class="hero-title">AI 量化选股引擎</div>
+            <div class="hero-desc" id="heroDesc">运行策略后将在此展示结果</div>
+          </div>
+        </div>
+        <!-- 结果表格 -->
+        <table class="stock-table" id="stockTable" style="display:none">
+          <thead><tr><th>#</th><th>名称</th><th>代码</th><th>来源</th><th>现价</th><th>涨跌</th><th>评分</th><th>换手</th><th>RSI</th><th>PE</th><th>量比</th><th>RPS20</th></tr></thead>
+          <tbody id="stockTbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+var STRATEGIES = {{strategies|tojson}};
+var ALL_ORDER = {{all_order|tojson}};
+var allResults = {};
+var activeKey = 'momentum';
+var currentReader = null;
+var isRunning = false;
+
+// ---- Tabs ----
+(function(){
+  var row = document.getElementById('tabRow');
+  var allBtn = document.createElement('button');
+  allBtn.className = 'tab all-tab active';
+  allBtn.id = 'tab-all';
+  allBtn.innerHTML = '&#x1f30d; 综合';
+  allBtn.onclick = function(){switchTab('all');};
+  row.appendChild(allBtn);
+  activeKey = 'all';
+  ALL_ORDER.forEach(function(k){
+    var s = STRATEGIES[k];
+    var b = document.createElement('button');
+    b.className = 'tab';
+    b.id = 'tab-'+k;
+    b.innerHTML = s.icon+' '+s.name;
+    b.onclick = function(){switchTab(k);};
+    row.appendChild(b);
+  });
+})();
+
+function switchTab(key) {
+  activeKey = key;
+  document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
+  var tb = document.getElementById('tab-'+key);
+  if (tb) tb.classList.add('active');
+  showResult(key);
+}
+
+function showResult(key) {
+  var data = allResults[key];
+  if (!data || !data.stocks || data.stocks.length===0) {
+    document.getElementById('rightHero').style.display = '';
+    document.getElementById('stockTable').style.display = 'none';
+    var desc = document.getElementById('heroDesc');
+    if (data && data.stocks && data.stocks.length === 0) {
+      desc.textContent = '该策略未筛选出符合条件的股票，可能是数据源暂时不可用';
+    } else {
+      desc.textContent = '运行策略后将在此展示结果';
+    }
+    return;
+  }
+  document.getElementById('rightHero').style.display = 'none';
+  document.getElementById('stockTable').style.display = '';
+  var tbody = document.getElementById('stockTbody');
+  tbody.innerHTML = data.stocks.map(function(s,i){
+    var cc = s.chg>=0?'up':'down';
+    var bc = s.score>=80?'#00d2a0':s.score>=60?'#feca57':'#ff6b6b';
+    var srcTag = s.source ? '<span class="source-tag">'+esc(s.source)+'</span>' : '';
+    return '<tr>'+
+      '<td>'+(i+1)+'</td>'+
+      '<td style="font-weight:600">'+(s.name||'')+'</td>'+
+      '<td style="color:var(--dim)">'+s.code+'</td>'+
+      '<td>'+srcTag+'</td>'+
+      '<td>'+(s.price?s.price.toFixed(2):'-')+'</td>'+
+      '<td class="'+cc+'">'+(s.chg>=0?'+':'')+(s.chg?s.chg.toFixed(1):'-')+'%</td>'+
+      '<td><span style="display:inline-block;background:'+bc+';color:#000;font-weight:700;padding:2px 7px;border-radius:10px;font-size:11px">'+(s.score||'-')+'</span></td>'+
+      '<td>'+(s.turnover?s.turnover.toFixed(1):'-')+'%</td>'+
+      '<td>'+(s.rsi14?s.rsi14.toFixed(0):(s.rsi6?s.rsi6.toFixed(0):'-'))+'</td>'+
+      '<td>'+(s.pe?s.pe.toFixed(1):'-')+'</td>'+
+      '<td>'+(s.volume_ratio?s.volume_ratio.toFixed(1):'-')+'x</td>'+
+      '<td>'+(s.rps20?s.rps20.toFixed(0):'-')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+function showRecCards(recs) {
+  var wrap = document.getElementById('recCardWrap');
+  if (!recs || recs.length===0) { wrap.style.display='none'; return; }
+  wrap.style.display = '';
+  wrap.innerHTML = recs.slice(0,4).map(function(rec,idx){
+    var color = rec.source_key ? STRATEGIES[rec.source_key].color : 'var(--accent)';
+    return '<div class="rec-card" style="border-color:'+color+';background:linear-gradient(135deg,'+color+'15,'+color+'05)">'+
+      '<div class="rec-top">'+
+        '<div><div class="rec-name">'+(rec.name||'')+'</div><div class="rec-code">'+rec.code+' | '+esc(rec.source_name||'')+'</div></div>'+
+        '<div style="text-align:right"><div style="font-size:10px;color:var(--dim)">评分</div><div style="font-size:24px;font-weight:700;color:'+color+'">'+rec.score+'</div></div>'+
+      '</div>'+
+      '<div class="rec-price">'+(rec.price?'¥'+rec.price.toFixed(2):'--')+(rec.chg?' <span class="rec-chg '+(rec.chg>=0?'up':'down')+'">'+(rec.chg>=0?'+':'')+rec.chg.toFixed(1)+'%</span>':'')+'</div>'+
+      '<div class="rec-metrics">'+
+        (rec.target_low?'<div class="rec-metric"><label>目标价</label><value class="up">¥'+rec.target_low+'~'+rec.target_high+'</value></div>':'')+
+        (rec.stop_price?'<div class="rec-metric"><label>止损价</label><value class="down">¥'+rec.stop_price+'</value></div>':'')+
+        (rec.turnover?'<div class="rec-metric"><label>换手率</label><value>'+rec.turnover.toFixed(1)+'%</value></div>':'')+
+        (rec.rps20?'<div class="rec-metric"><label>RPS20</label><value>'+rec.rps20.toFixed(0)+'</value></div>':'')+
+        (rec.pe?'<div class="rec-metric"><label>PE</label><value>'+rec.pe.toFixed(1)+'</value></div>':'')+
+      '</div></div>';
+  }).join('');
+}
+
+// ---- 单策略 ----
+function runSingle(key) {
+  if (currentReader) { try{currentReader.cancel()}catch(e){}; currentReader = null; }
+  activeKey = key; switchTab(key);
+  resetAllBtns(); resetSingleBtns();
+  var btn = document.getElementById('btn-'+key);
+  var pw = document.getElementById('pwrap-'+key);
+  var pb = document.getElementById('pbar-'+key);
+  var log = document.getElementById('logPanel');
+  log.innerHTML = '';
+  btn.classList.add('running');
+  pw.style.display = ''; pb.style.width = '0%';
+  document.getElementById('recCardWrap').style.display = 'none';
+  isRunning = true;
+  startStream('/api/run/'+key, {
+    onLog: function(line, prog){ addLog(line); pb.style.width = prog+'%'; },
+    onDone: function(result){
+      pb.style.width = '100%'; btn.classList.remove('running');
+      allResults[key] = result;
+      showResult(key);
+      if(result.recommendation) showRecCards([result.recommendation]);
+      setTimeout(function(){pw.style.display='none'},2500);
+      isRunning = false; document.getElementById('sysStatus').innerHTML = '&#x25cf; 就绪';
+    },
+    onError: function(e){ addLog('ERROR: '+e,'err'); btn.classList.remove('running'); isRunning=false; }
+  });
+}
+
+// ---- 综合选股 ----
+function runAll() {
+  if (currentReader) { try{currentReader.cancel()}catch(e){}; currentReader = null; }
+  activeKey = 'all'; switchTab('all');
+  resetAllBtns(); resetSingleBtns();
+  var allBtn = document.getElementById('allBtn');
+  var log = document.getElementById('logPanel');
+  log.innerHTML = '';
+  allBtn.classList.add('running');
+  allBtn.textContent = '运行中...';
+  document.getElementById('recCardWrap').style.display = 'none';
+  isRunning = true;
+  document.getElementById('sysStatus').innerHTML = '<span style="color:var(--yellow)">&#x25cf; 综合选股中</span>';
+
+  ALL_ORDER.forEach(function(k){
+    var pw = document.getElementById('pwrap-'+k);
+    var pb = document.getElementById('pbar-'+k);
+    var btn = document.getElementById('btn-'+k);
+    pw.style.display = ''; pb.style.width = '0%';
+    btn.classList.add('running');
+  });
+
+  var currentStrat = null;
+  startStream('/api/run-all', {
+    onLog: function(line, prog, key){
+      if (key && key !== currentStrat) {
+        currentStrat = key;
+        addLog('--- '+STRATEGIES[key].icon+' '+STRATEGIES[key].name+' ---', 'st');
+      }
+      var pb = document.getElementById('pbar-'+key);
+      if (pb) pb.style.width = prog+'%';
+      addLog(line);
+    },
+    onStrategyDone: function(key){
+      var btn = document.getElementById('btn-'+key);
+      var pb = document.getElementById('pbar-'+key);
+      pb.style.width = '100%';
+      if (btn) btn.classList.remove('running');
+      addLog(STRATEGIES[key].icon+' '+STRATEGIES[key].name+' 完成', 'ok');
+    },
+    onAllDone: function(result){
+      document.getElementById('allBtn').classList.remove('running');
+      document.getElementById('allBtn').textContent = '综合选股 · 四策略一键运行';
+      ALL_ORDER.forEach(function(k){
+        var pw = document.getElementById('pwrap-'+k);
+        setTimeout(function(){pw.style.display='none'},2000);
+      });
+      allResults['all'] = result;
+      showResult('all');
+      showRecCards(result.recommendations);
+      isRunning = false;
+      document.getElementById('sysStatus').innerHTML = '&#x25cf; 就绪';
+      addLog('===== 综合选股完成! 共 '+result.stocks.length+' 只候选 =====', 'ok');
+    }
+  });
+}
+
+// ---- 通用 SSE 流 ----
+function startStream(url, callbacks) {
+  callbacks = callbacks || {};
+  fetch(url).then(function(resp){
+    var reader = resp.body.getReader();
+    currentReader = reader;
+    var decoder = new TextDecoder('utf-8'), buf = '';
+    function pump(){
+      reader.read().then(function(r){
+        if (r.done) { currentReader=null; return; }
+        buf += decoder.decode(r.value, {stream:true});
+        var lines = buf.split('\n'); buf = lines.pop()||'';
+        lines.forEach(function(line){
+          if (line.indexOf('data: ') !== 0) return;
+          try { var d = JSON.parse(line.slice(6)); } catch(e) { return; }
+          if (d.type === 'log' && callbacks.onLog) callbacks.onLog(d.line, d.progress);
+          else if (d.type === 'done' && callbacks.onDone) callbacks.onDone(d.result);
+          else if (d.type === 'error' && callbacks.onError) callbacks.onError(d.msg);
+          else if (d.type === 'all_log' && callbacks.onLog) callbacks.onLog(d.line, d.progress, d.key);
+          else if (d.type === 'strategy_done' && callbacks.onStrategyDone) callbacks.onStrategyDone(d.key);
+          else if (d.type === 'all_done' && callbacks.onAllDone) callbacks.onAllDone(d.result);
+        });
+        pump();
+      }).catch(function(e){
+        if (callbacks.onError) callbacks.onError(String(e));
+        currentReader = null; isRunning = false;
+      });
+    }
+    pump();
+  }).catch(function(e){
+    if (callbacks.onError) callbacks.onError('fetch: '+String(e));
+    isRunning = false;
+  });
+}
+
+function addLog(text, cls) {
+  var log = document.getElementById('logPanel');
+  log.innerHTML += '<div class="'+(cls||'')+'">'+esc(text)+'</div>';
+  log.scrollTop = log.scrollHeight;
+}
+
+function resetAllBtns() {
+  document.getElementById('allBtn').classList.remove('running');
+  document.getElementById('allBtn').textContent = '综合选股 · 四策略一键运行';
+}
+function resetSingleBtns() {
+  ALL_ORDER.forEach(function(k){
+    document.getElementById('btn-'+k).classList.remove('running');
+  });
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ---- 精致 K 线图动画 ----
+(function initChart(){
+  var wrap = document.getElementById('candlesWrap');
+  var labels = document.getElementById('candleLabel');
+  if (!wrap || !labels) return;
+  var count = 22;
+  var html = '', lbls = '';
+  for (var i = 0; i < count; i++) {
+    var up = Math.random() > 0.32;
+    var h = 20 + Math.random() * 130;
+    var bodyH = 15 + Math.random() * (h - 10);
+    var wickTop = (h - bodyH) * Math.random();
+    var wickBot = h - bodyH - wickTop;
+    var delay = i * 0.07;
+    html += '<div class="candle '+(up?'up':'dn')+'" style="animation-delay:'+delay+'s">'+
+      '<div class="wick" style="height:'+Math.max(wickTop,2)+'px"></div>'+
+      '<div class="body" style="height:'+Math.max(bodyH,3)+'px"></div>'+
+      '<div class="wick" style="height:'+Math.max(wickBot,0)+'px"></div></div>';
+    if (i % 5 === 0) lbls += '<span>'+(i===0?'09:30':i===5?'10:00':i===10?'11:00':i===15?'13:30':i===20?'15:00':'')+'</span>';
+    else lbls += '<span></span>';
+  }
+  wrap.innerHTML = html;
+  labels.innerHTML = lbls;
+
+  // 价格跳动
+  var basePrice = 3286.52 + Math.random() * 50 - 25;
+  var tickNum = document.getElementById('tickNum');
+  var tickPct = document.getElementById('tickPct');
+  var basePct = 0.8 + Math.random() * 1.2;
+  setInterval(function(){
+    var change = (Math.random() - 0.45) * 8;
+    basePrice += change;
+    tickNum.textContent = basePrice.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+    var pct = (change > 0 ? '+' : '') + (change * 0.03).toFixed(2) + '%';
+    tickPct.textContent = pct;
+    tickPct.style.background = change >= 0 ? 'rgba(0,210,160,.15)' : 'rgba(255,107,107,.15)';
+    tickPct.style.color = change >= 0 ? 'var(--green)' : 'var(--red)';
+    tickNum.style.color = change >= 0 ? 'var(--green)' : 'var(--red)';
+  }, 2200);
+
+  // 浮动粒子
+  (function spawnParticle(){
+    if (!document.getElementById('rightHero') || document.getElementById('rightHero').style.display === 'none') return;
+    var box = document.getElementById('chartBox');
+    if (!box) return;
+    var el = document.createElement('span');
+    var isUp = Math.random() > 0.4;
+    var vals = ['+3.2%','+1.8%','-2.1%','+5.6%','-0.9%','+2.4%','+4.1%','-1.5%','+6.2%','-0.3%'];
+    el.textContent = isUp ? vals.filter(function(v){return v[0]==='+'})[Math.floor(Math.random()*6)] : vals.filter(function(v){return v[0]==='-'})[Math.floor(Math.random()*3)];
+    el.className = 'particle ' + (isUp ? 'p-up' : 'p-dn');
+    el.style.left = (5 + Math.random() * 85) + '%';
+    el.style.bottom = (10 + Math.random() * 40) + '%';
+    el.style.animationDuration = (2 + Math.random() * 2.5) + 's';
+    box.appendChild(el);
+    setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); }, 3000);
+    setTimeout(spawnParticle, 1800 + Math.random() * 2000);
+  })();
+})();
+
+// ---- 时钟 ----
+function tick(){
+  var n = new Date();
+  document.getElementById('clock').textContent = n.toLocaleDateString('zh-CN')+' '+n.toLocaleTimeString('zh-CN');
+}
+setInterval(tick,1000); tick();
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    print("\n  A股策略可视化仪表盘 v3")
+    print("  ========================")
+    print("  综合选股 · 四策略一键运行")
+    print("  访问: http://127.0.0.1:5000\n")
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import sys
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
 HEADERS = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
@@ -172,6 +173,9 @@ def _fetch_market_extra_data(market_id, fs_val, label):
                 }
         except:
             break
+        if pn % 5 == 0:
+            print(f"      换手率 {label} 第{pn}页 ({len(data)}只)...")
+            sys.stdout.flush()
         time.sleep(0.15)
     return data
 
@@ -192,6 +196,7 @@ def get_extra_data_batch(codes):
     # 如果缓存过期，重新拉全市场数据
     if _extra_data_cache_date != today or not _extra_data_cache:
         print("    (拉取全市场换手率+资金数据, 约30秒...)")
+        sys.stdout.flush()
         all_data = {}
         for market_id, fs_val, label in [
             (0, "m:0+t:6,m:0+t:80", "深市"),
@@ -373,6 +378,9 @@ def _fetch_market_fundamental(market_id, fs_val):
                 }
         except:
             break
+        if pn % 5 == 0:
+            print(f"      基本面 第{pn}页 ({len(data)}只)...")
+            sys.stdout.flush()
         time.sleep(0.15)
     return data
 

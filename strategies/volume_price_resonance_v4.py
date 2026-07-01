@@ -160,9 +160,9 @@ for idx, cand in enumerate(candidates):
         pb = fund.get("pb", 0)
         total_mv = fund.get("total_mv", 0)
 
-        if pe < 0 or pe > 200:
+        if pe != 0 and (pe < 0 or pe > 200):
             continue
-        if pb > 10:
+        if pb != 0 and pb > 10:
             continue
         if 0 < total_mv < 2_000_000_000:
             continue

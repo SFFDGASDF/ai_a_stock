@@ -148,10 +148,10 @@ for idx, c in enumerate(candidates):
         pb = fund.get("pb", 0)
         total_mv = fund.get("total_mv", 0)
 
-        # 超跌质量过滤
-        if pe < 0 or pe > 200:
+        # 超跌质量过滤（pe/pb=0表示数据不可用，跳过过滤）
+        if pe != 0 and (pe < 0 or pe > 200):
             continue
-        if pb < 0.5:  # 破净太严重
+        if pb != 0 and pb < 0.5:  # 破净太严重
             continue
         if 0 < total_mv < 3_000_000_000:
             continue
