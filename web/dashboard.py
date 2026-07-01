@@ -340,9 +340,10 @@ def api_kline(code):
     """
     try:
         period = request.args.get("period", "day")
-        category_map = {"minute": 0, "day": 4, "week": 5, "month": 6}
+        # mootdx TDX protocol: 4=日K 5=周K 6=月K 7=5分钟K线
+        category_map = {"minute": 7, "day": 4, "week": 5, "month": 6}
         category = category_map.get(period, 4)
-        offset_map = {"minute": 240, "day": 120, "week": 80, "month": 60}
+        offset_map = {"minute": 48, "day": 120, "week": 80, "month": 60}
         offset = offset_map.get(period, 120)
 
         from mootdx.quotes import Quotes
@@ -377,19 +378,31 @@ def api_kline(code):
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.sort_values('datetime')
 
-        # 分时数据字段可能不同
+        # 分时(5分钟K线) 和 K线都使用 OHLC 结构处理
         if period == "minute":
-            # 分时: 直接用 price/vol
-            prices = df['price'].astype(float).tolist()
-            vols = df['vol'].astype(float).tolist()
+            # 5分钟K线：返回 close 作为分时线，同时也提供 OHLC
+            o = df['open'].astype(float)
+            h = df['high'].astype(float)
+            l = df['low'].astype(float)
+            c = df['close'].astype(float)
+            v = df['vol'].astype(float)
             dates = df['datetime'].astype(str).tolist()
-            last_price = float(prices[-1]) if prices else 0
-            prev_close = float(bars.iloc[0].get('last_close', last_price)) if len(bars) > 0 else last_price
+
+            last_price = float(c.iloc[-1])
+            prev_close = float(c.iloc[0]) if len(c) > 0 else last_price
             chg_pct = round((last_price / prev_close - 1) * 100, 2) if prev_close > 0 else 0
 
             result = {
                 "code": code, "period": "minute",
-                "dates": dates, "prices": prices, "volumes": vols,
+                "dates": dates,
+                "open": o.tolist(), "high": h.tolist(),
+                "low": l.tolist(), "close": c.tolist(),
+                "volume": v.tolist(),
+                "ma5": c.rolling(5).mean().round(2).tolist(),
+                "ma10": c.rolling(10).mean().round(2).tolist(),
+                "ma20": c.rolling(20).mean().round(2).tolist(),
+                "ma60": [], "dif": [], "dea": [], "macd_hist": [],
+                "rsi14": [], "k": [], "d": [], "j": [],
                 "last_price": last_price, "prev_close": prev_close,
                 "chg_pct": chg_pct,
             }

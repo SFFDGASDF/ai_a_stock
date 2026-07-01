@@ -635,19 +635,21 @@ function renderKlineChart(data) {
   var upColor = '#ef4444', downColor = '#22c55e';
 
   if (data.period === 'minute') {
-    // 分时图
+    // 分时图 — 5分钟K线 close 连线 + 成交量
     var option = {
       backgroundColor: '#141e2a',
-      grid: [{left:'8%',right:'5%',top:20,height:'60%'},{left:'8%',right:'5%',top:'72%',height:'22%'}],
+      grid: [{left:'8%',right:'5%',top:20,height:'52%'},{left:'8%',right:'5%',top:'78%',height:'16%'}],
       xAxis: [{type:'category',data:dates,axisLine:{lineStyle:{color:'#334'}},axisLabel:{fontSize:9,color:'#688'},gridIndex:0},
               {type:'category',data:dates,axisLine:{lineStyle:{color:'#334'}},axisLabel:{show:false},gridIndex:1}],
       yAxis: [{scale:true,splitLine:{lineStyle:{color:'rgba(255,255,255,.06)'}},axisLabel:{color:'#688'},gridIndex:0},
               {scale:true,splitLine:{show:false},axisLabel:{color:'#688'},gridIndex:1}],
+      dataZoom: [{type:'inside',xAxisIndex:[0,1]}],
       series: [
-        {name:'价格',type:'line',data:data.prices,smooth:true,symbol:'none',
+        {name:'价格',type:'line',data:data.close,smooth:true,symbol:'none',
          lineStyle:{color:'#48dbfb',width:1.5},areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(72,219,251,.3)'},{offset:1,color:'rgba(72,219,251,0)'}])},xAxisIndex:0,yAxisIndex:0},
-        {name:'均价',type:'line',data:data.prices,smooth:true,symbol:'none',lineStyle:{color:'#feca57',width:1,type:'dashed'},xAxisIndex:0,yAxisIndex:0},
-        {name:'量',type:'bar',data:data.volumes,itemStyle:{color:'rgba(72,219,251,.3)'},xAxisIndex:1,yAxisIndex:1}
+        {name:'MA5',type:'line',data:data.ma5,smooth:true,symbol:'none',lineStyle:{width:1,color:'#f59e0b'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA10',type:'line',data:data.ma10,smooth:true,symbol:'none',lineStyle:{width:1,color:'#3b82f6'},xAxisIndex:0,yAxisIndex:0},
+        {name:'量',type:'bar',data:data.volume,itemStyle:{color:'rgba(72,219,251,.3)'},xAxisIndex:1,yAxisIndex:1}
       ],
       tooltip:{trigger:'axis'},
     };
