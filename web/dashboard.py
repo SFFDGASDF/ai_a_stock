@@ -340,18 +340,16 @@ def api_kline(code):
     """
     try:
         period = request.args.get("period", "day")
-        # mootdx TDX protocol: 4=日K 5=周K 6=月K 7=5分钟K线
-        category_map = {"minute": 7, "day": 4, "week": 5, "month": 6}
-        category = category_map.get(period, 4)
-        offset_map = {"minute": 48, "day": 120, "week": 80, "month": 60}
-        offset = offset_map.get(period, 120)
 
         from mootdx.quotes import Quotes
         import pandas as pd
         import numpy as np
 
         client = Quotes.factory(market='std')
-        bars = client.bars(symbol=code, category=category, offset=offset)
+
+        # TDX 服务器全 category 都返回日线，统一拉取日线后重采样
+        fetch_offset = {"minute": 60, "day": 120, "week": 300, "month": 600}
+        bars = client.bars(symbol=code, category=4, offset=fetch_offset.get(period, 120))
 
         if bars is None or len(bars) < 10:
             return jsonify({"error": "K线数据不足"}), 404
@@ -377,6 +375,23 @@ def api_kline(code):
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.sort_values('datetime')
+
+        # 周K/月K 从日线数据重采样
+        if period in ("week", "month"):
+            df = df.set_index('datetime')
+            rule = 'W' if period == 'week' else 'ME'
+            label_map = {'W': '周', 'ME': '月'}
+            df = df.resample(rule).agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'vol': 'sum', 'amount': 'sum'
+            }).dropna()
+            # 生成周/月标签
+            if period == 'week':
+                new_dates = [d.strftime('%Y-%m-%d') + ' 周' for d in df.index]
+            else:
+                new_dates = [d.strftime('%Y-%m') for d in df.index]
+            df['datetime'] = new_dates
+            df = df.reset_index(drop=True)
 
         # 分时(5分钟K线) 和 K线都使用 OHLC 结构处理
         if period == "minute":
