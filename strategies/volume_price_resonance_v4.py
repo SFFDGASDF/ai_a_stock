@@ -170,8 +170,9 @@ for idx, cand in enumerate(candidates):
         # === V4: 真实RPS ===
         rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, global_chg20, None)
 
-        # VIP检查
-        if ind["vr"] < 0.8:
+        # VIP检查（API数据不可用时放宽vr阈值）
+        vr_threshold = 0.5 if len(extra_data) == 0 else 0.8
+        if ind["vr"] < vr_threshold:
             continue
 
         close_s = df["close"].astype(float)
@@ -289,7 +290,7 @@ for idx, cand in enumerate(candidates):
         dev = ind["dev"]
         if dev > 25: penalty += 12; details.append((f"乖离{dev:.0f}%", -12))
         elif dev > 20: penalty += 8
-        if ind["upper_shadow"] > 3 and ind["vr"] > 1.5:
+        if cand["upper_shadow"] > 3 and ind["vr"] > 1.5:
             penalty += 8; details.append(("放量上影出货", -8))
         if ind["j"] > 105: penalty += 3
         if ind["up_days"] >= 5: penalty += 6; details.append((f"连涨{ind['up_days']}天", -6))

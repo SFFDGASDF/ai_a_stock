@@ -1,7 +1,7 @@
 """
 A股策略可视化仪表盘 v3 — 综合选股 + 进度动画 + 协调UI
 """
-import json, sys, os, time, threading, subprocess, re, itertools
+import json, sys, os, time, threading, queue, re, itertools, io, base64
 from flask import Flask, Response, render_template_string, jsonify
 
 app = Flask(__name__)
@@ -64,18 +64,69 @@ def parse_strategy_output(lines):
     return result
 
 
+class _LineWriter:
+    """自定义stdout，将每行输出放入队列实现实时流式传输"""
+    def __init__(self, q):
+        self.q = q
+        self._buf = ""
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self.q.put(line)
+    def flush(self):
+        if self._buf:
+            self.q.put(self._buf)
+            self._buf = ""
+
+
 def run_strategy_stream(strategy_key):
     info = STRATEGIES[strategy_key]
     script = os.path.join(STRATEGIES_DIR, info["file"])
     with _run_lock: _run_status[strategy_key] = {"running":True,"progress":0,"done":False}
     def emit(etype,**kw): return f"data: {json.dumps(dict(type=etype,**kw),ensure_ascii=False)}\n\n"
     try:
-        env = os.environ.copy(); env["PYTHONUNBUFFERED"]="1"; env["PYTHONIOENCODING"]="utf-8"
-        proc = subprocess.Popen([sys.executable,"-X","utf8",script],cwd=BASE_DIR,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env)
+        q = queue.Queue()
+        writer = _LineWriter(q)
+        error_occurred = {"flag": False, "msg": ""}
+
+        def _run_script():
+            old_stdout = sys.stdout
+            old_cwd = os.getcwd()
+            sys.stdout = writer
+            os.chdir(BASE_DIR)
+            try:
+                with open(script, "r", encoding="utf-8") as sf:
+                    code = compile(sf.read(), script, "exec")
+                exec(code, {"__name__": "__main__", "__file__": script})
+            except Exception as e:
+                import traceback
+                error_occurred["flag"] = True
+                error_occurred["msg"] = str(e)
+                traceback.print_exc()
+            finally:
+                sys.stdout = old_stdout
+                os.chdir(old_cwd)
+                writer.flush()
+                q.put(None)
+
+        t = threading.Thread(target=_run_script, daemon=True)
+        t.start()
+
         all_lines = []; last_p = 0
-        for raw in proc.stdout:
-            try: line = raw.decode("utf-8",errors="replace").rstrip("\r\n")
-            except: line = raw.decode("gbk",errors="replace").rstrip("\r\n")
+        while True:
+            try:
+                line = q.get(timeout=0.2)
+            except queue.Empty:
+                if not t.is_alive():
+                    try: line = q.get_nowait()
+                    except queue.Empty: break
+                continue
+            if line is None:
+                break
+            if error_occurred["flag"]:
+                yield emit("error", msg=error_occurred["msg"])
+                break
             all_lines.append(line)
             progress = last_p
             if "[0/7]" in line: progress = 5
@@ -91,10 +142,15 @@ def run_strategy_stream(strategy_key):
             if progress > last_p: last_p = progress
             with _run_lock: _run_status[strategy_key] = {"running":True,"progress":progress,"done":False}
             yield emit("log", line=line, progress=progress)
-        proc.wait()
-        result = parse_strategy_output(all_lines)
-        with _run_lock: _run_status[strategy_key] = {"running":False,"progress":100,"done":True,"result":result}
-        yield emit("done", result=result)
+
+        t.join(timeout=5)
+        if error_occurred["flag"]:
+            with _run_lock: _run_status[strategy_key] = {"running":False,"progress":0,"done":True,"error":error_occurred["msg"]}
+            yield emit("error", msg=error_occurred["msg"])
+        else:
+            result = parse_strategy_output(all_lines)
+            with _run_lock: _run_status[strategy_key] = {"running":False,"progress":100,"done":True,"result":result}
+            yield emit("done", result=result)
     except Exception as e:
         import traceback; traceback.print_exc()
         yield emit("error", msg=str(e))
@@ -142,7 +198,7 @@ def api_run_all():
                                 r["recommendation"]["source_icon"] = info["icon"]
                                 merged["recommendations"].append(r["recommendation"])
                             merged["done_count"] = idx + 1
-                            yield f"data: {json.dumps({'type':'strategy_done','key':key,'done_count':idx+1,'total':4},ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type':'strategy_done','key':key,'done_count':idx+1,'total':4,'result':r},ensure_ascii=False)}\n\n"
                     except: pass
         # 去重、排序合并结果
         seen = set()
@@ -158,6 +214,80 @@ def api_run_all():
         yield f"data: {json.dumps({'type':'all_done','result':merged},ensure_ascii=False)}\n\n"
     return Response(generate(), mimetype="text/event-stream; charset=utf-8",
         headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"})
+
+
+@app.route("/api/chart/<code>")
+def api_chart(code):
+    """股票快照行情图: K线(60日) + 均线 + 成交量, 返回base64 PNG"""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.font_manager as fm
+        # 中文字体: 必须在 import pyplot 之前设置，清除缓存确保生效
+        try: fm._load_fontmanager(try_read_cache=False)
+        except: pass
+        font_paths = [
+            'C:/Windows/Fonts/msyh.ttc',   # 微软雅黑
+            'C:/Windows/Fonts/simsun.ttc',  # 宋体
+            'C:/Windows/Fonts/simhei.ttf',  # 黑体
+        ]
+        for fp in font_paths:
+            if os.path.exists(fp):
+                fm.fontManager.addfont(fp)
+                break
+        # 使用英文标签, 避免中文字体缺失导致缺字
+        matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False
+
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
+        import pandas as pd
+        from mootdx.quotes import Quotes
+        from stock_utils import calc_technical_indicators
+        client = Quotes.factory(market='std')
+
+        bars = client.bars(symbol=code, category=4, offset=70)
+        if bars is None or len(bars) < 20:
+            return jsonify({"error": "K线数据不足"}), 404
+
+        df = pd.DataFrame(bars)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.set_index('datetime').sort_index()
+        df = df.rename(columns={'open':'Open','close':'Close','high':'High','low':'Low','vol':'Volume'})
+
+        ind = calc_technical_indicators(bars)
+        name = code  # 使用代码作为fallback
+        try:
+            from stock_utils import get_name_batch
+            nm = get_name_batch([code])
+            if nm: name = nm.get(code, code)
+        except: pass
+
+        chg_str = ""
+        if len(df) >= 2:
+            chg = (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
+            chg_str = f"{chg:+.1f}%"
+
+        colors = mpf.make_marketcolors(up='#ef4444',down='#22c55e',edge='inherit',wick='inherit',volume={'up':'#ef4444','down':'#22c55e'},alpha=0.8)
+        style = mpf.make_mpf_style(marketcolors=colors,gridcolor='#e5e7eb',facecolor='#fafafa',figcolor='#fafafa')
+
+        apds = [
+            mpf.make_addplot(df['Volume'],type='bar',width=0.7,alpha=0.35,color='#9ca3af',panel=1,secondary_y=False),
+        ]
+        fig, axes = mpf.plot(df, type='candle', style=style, mav=(5,10,20),
+                 volume=False, addplot=apds, panel_ratios=(3,1), figsize=(10,5.5),
+                 title=f"\n{code}  Price:{ind['cur']:.2f}  Chg:{chg_str}  RSI14:{ind['rsi14']:.0f}  Vol:{ind.get('vr',1):.1f}x",
+                 returnfig=True, warn_too_much_data=200)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
+        return jsonify({"image": "data:image/png;base64," + img_b64, "name": name, "code": code})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================
@@ -209,7 +339,7 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 .all-btn.running{animation:allGlow 1.2s ease-in-out infinite;pointer-events:none}
 @keyframes allGlow{0%,100%{box-shadow:0 0 20px rgba(255,107,107,.4)}25%{box-shadow:0 0 25px rgba(254,202,87,.4)}50%{box-shadow:0 0 25px rgba(72,219,251,.4)}75%{box-shadow:0 0 20px rgba(0,210,160,.4)}}
 /* ---- 精致 K 线动画 ---- */
-.chart-hero{display:flex;align-items:center;justify-content:center;flex-direction:column;position:relative;width:100%;height:100%;overflow:hidden}
+.chart-hero{display:flex;align-items:center;justify-content:center;flex-direction:column;position:relative;width:100%;flex-shrink:0;padding:8px 0 4px;transition:all .3s}
 .chart-box{position:relative;width:540px;height:200px}
 .chart-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(35,48,68,.25) 1px,transparent 1px),linear-gradient(90deg,rgba(35,48,68,.25) 1px,transparent 1px);background-size:36px 36px;border-radius:4px}
 .chart-glow{position:absolute;left:20%;right:30%;top:15%;bottom:25%;background:radial-gradient(ellipse,rgba(0,210,160,.06),transparent 70%);pointer-events:none;animation:glowBreath 3s ease-in-out infinite}
@@ -238,6 +368,10 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 @keyframes floatUp{0%{opacity:1;transform:translateY(0) scale(1)}70%{opacity:.6}100%{opacity:0;transform:translateY(-140px) scale(.4)}}
 .hero-title{font-size:15px;font-weight:700;color:var(--text);margin-bottom:4px}
 .hero-desc{font-size:11px;color:var(--dim)}
+.hero-meta{margin-top:10px;text-align:center}
+.hero-score{font-size:24px;font-weight:700;margin-top:4px;transition:color .3s}
+.chart-hero.hero-slim .chart-box{height:180px}
+.chart-hero.hero-slim .hero-meta{margin-top:6px}
 .candle-label{position:absolute;bottom:6px;left:30px;right:46px;display:flex;justify-content:space-around;font-size:8px;color:rgba(90,109,128,.4)}
 .rec-card{background:linear-gradient(135deg,rgba(255,107,107,.12),rgba(254,202,87,.08),rgba(72,219,251,.06));border:1px solid rgba(255,107,107,.3);border-radius:12px;padding:18px;margin-bottom:10px;animation:fadeIn .5s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -264,6 +398,24 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 .tab.all-tab.active{background:rgba(254,202,87,.25);color:#fff}
 .badge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;border-radius:9px;font-size:10px;font-weight:700;background:var(--accent);color:#000;margin-left:4px;padding:0 5px}
 .scroll-box{overflow-y:auto;flex:1;min-height:0}
+.stock-table tbody tr{cursor:pointer;transition:all .2s}
+.stock-table tbody tr:hover{background:rgba(72,219,251,.1)!important;transform:scale(1.003)}
+/* ---- 模态弹窗 ---- */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;display:flex;align-items:center;justify-content:center;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .35s cubic-bezier(.4,0,.2,1),visibility .35s}
+.modal-overlay.show{opacity:1;visibility:visible;pointer-events:auto}
+.modal-box{background:var(--card);border-radius:14px;border:1px solid var(--border);max-width:860px;width:92vw;max-height:92vh;overflow-y:auto;overflow-x:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5);opacity:0;transform:translateY(28px) scale(.95);transition:opacity .4s cubic-bezier(.4,0,.2,1),transform .4s cubic-bezier(.4,0,.2,1)}
+.modal-overlay.show .modal-box{opacity:1;transform:translateY(0) scale(1)}
+.modal-close{position:sticky;top:0;float:right;background:rgba(255,255,255,.08);border:none;color:var(--text);font-size:22px;cursor:pointer;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:10px 10px 0 0;transition:all .2s;z-index:1}
+.modal-close:hover{background:rgba(255,107,107,.3);color:#fff}
+.modal-content{padding:0 20px 20px}
+.modal-title{font-size:18px;font-weight:700;color:#fff;padding:14px 20px 8px}
+.modal-title .m-code{font-size:13px;color:var(--dim);margin-left:6px}
+.modal-loader{display:flex;align-items:center;justify-content:center;min-height:300px}
+.modal-spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.modal-chart-img{width:100%;border-radius:8px;opacity:0;transition:opacity .3s ease}
+.modal-chart-img.loaded{opacity:1}
+.modal-error{text-align:center;padding:40px;color:var(--red)}
 </style>
 </head>
 <body>
@@ -343,9 +495,10 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
             </div>
             <div class="candle-label" id="candleLabel"></div>
           </div>
-          <div style="margin-top:12px;text-align:center">
-            <div class="hero-title">AI 量化选股引擎</div>
+          <div class="hero-meta" id="heroMeta">
+            <div class="hero-title" id="heroTitle">AI 量化选股引擎</div>
             <div class="hero-desc" id="heroDesc">运行策略后将在此展示结果</div>
+            <div class="hero-score" id="heroScore" style="display:none"></div>
           </div>
         </div>
         <!-- 结果表格 -->
@@ -397,28 +550,24 @@ function switchTab(key) {
 
 function showResult(key) {
   var data = allResults[key];
+  // 更新 hero 顶部动画
+  updateHero(key);
   if (!data || !data.stocks || data.stocks.length===0) {
-    document.getElementById('rightHero').style.display = '';
     document.getElementById('stockTable').style.display = 'none';
-    var desc = document.getElementById('heroDesc');
-    if (data && data.stocks && data.stocks.length === 0) {
-      desc.textContent = '该策略未筛选出符合条件的股票，可能是数据源暂时不可用';
-    } else {
-      desc.textContent = '运行策略后将在此展示结果';
-    }
     return;
   }
-  document.getElementById('rightHero').style.display = 'none';
   document.getElementById('stockTable').style.display = '';
   var tbody = document.getElementById('stockTbody');
   tbody.innerHTML = data.stocks.map(function(s,i){
     var cc = s.chg>=0?'up':'down';
     var bc = s.score>=80?'#00d2a0':s.score>=60?'#feca57':'#ff6b6b';
     var srcTag = s.source ? '<span class="source-tag">'+esc(s.source)+'</span>' : '';
-    return '<tr>'+
+    var code = s.code;
+    var name = s.name || s.code;
+    return '<tr data-code="'+code+'" style="cursor:pointer">'+
       '<td>'+(i+1)+'</td>'+
-      '<td style="font-weight:600">'+(s.name||'')+'</td>'+
-      '<td style="color:var(--dim)">'+s.code+'</td>'+
+      '<td style="font-weight:600">'+esc(name)+'</td>'+
+      '<td style="color:var(--dim)">'+code+'</td>'+
       '<td>'+srcTag+'</td>'+
       '<td>'+(s.price?s.price.toFixed(2):'-')+'</td>'+
       '<td class="'+cc+'">'+(s.chg>=0?'+':'')+(s.chg?s.chg.toFixed(1):'-')+'%</td>'+
@@ -430,6 +579,63 @@ function showResult(key) {
       '<td>'+(s.rps20?s.rps20.toFixed(0):'-')+'</td>'+
     '</tr>';
   }).join('');
+  // 绑定点击事件 → 弹出K线弹窗
+  var rows = tbody.querySelectorAll('tr[data-code]');
+  for (var ri = 0; ri < rows.length; ri++) {
+    (function(tr) {
+      tr.addEventListener('click', function() {
+        openChart(tr.getAttribute('data-code'), tr.querySelector('td:nth-child(2)').textContent);
+      });
+    })(rows[ri]);
+  }
+}
+
+function updateHero(key) {
+  var data = allResults[key];
+  var titleEl = document.getElementById('heroTitle');
+  var descEl = document.getElementById('heroDesc');
+  var scoreEl = document.getElementById('heroScore');
+  var numEl = document.getElementById('tickNum');
+  var pctEl = document.getElementById('tickPct');
+  var heroEl = document.getElementById('rightHero');
+
+  if (!data || !data.stocks || data.stocks.length === 0) {
+    // 默认状态
+    titleEl.textContent = 'AI 量化选股引擎';
+    scoreEl.style.display = 'none';
+    heroEl.classList.remove('hero-slim');
+    if (data && data.stocks && data.stocks.length === 0) {
+      descEl.textContent = '该策略未筛选出符合条件的股票，可能是数据源暂时不可用';
+    } else {
+      descEl.textContent = '运行策略后将在此展示结果';
+    }
+    numEl.textContent = '3,286.52'; numEl.style.color = 'var(--green)';
+    pctEl.textContent = '+1.28%';
+    pctEl.style.background = 'rgba(0,210,160,.15)'; pctEl.style.color = 'var(--green)';
+    return;
+  }
+
+  var top = data.stocks[0];
+  var info = (key !== 'all' && STRATEGIES[key]) ? STRATEGIES[key] : null;
+  var icon = info ? info.icon+' ' : '';
+
+  titleEl.textContent = icon + (top.name || '--');
+  descEl.textContent = (top.code||'') + (top.source ? ' | '+top.source : '');
+  scoreEl.style.display = '';
+  var sc = top.score || 0;
+  scoreEl.textContent = sc + '分';
+  scoreEl.style.color = sc >= 80 ? 'var(--green)' : sc >= 60 ? 'var(--yellow)' : 'var(--red)';
+
+  var price = top.price ? top.price.toFixed(2) : '--';
+  var chg = top.chg || 0;
+  numEl.textContent = price;
+  pctEl.textContent = (chg>=0?'+':'') + chg.toFixed(1) + '%';
+  var isUp = chg >= 0;
+  var chgColor = isUp ? 'var(--green)' : 'var(--red)';
+  numEl.style.color = chgColor;
+  pctEl.style.color = chgColor;
+  pctEl.style.background = isUp ? 'rgba(0,210,160,.15)' : 'rgba(255,107,107,.15)';
+  heroEl.classList.add('hero-slim');
 }
 
 function showRecCards(recs) {
@@ -515,11 +721,12 @@ function runAll() {
       if (pb) pb.style.width = prog+'%';
       addLog(line);
     },
-    onStrategyDone: function(key){
+    onStrategyDone: function(key, result){
       var btn = document.getElementById('btn-'+key);
       var pb = document.getElementById('pbar-'+key);
       pb.style.width = '100%';
       if (btn) btn.classList.remove('running');
+      if (result) allResults[key] = result;
       addLog(STRATEGIES[key].icon+' '+STRATEGIES[key].name+' 完成', 'ok');
     },
     onAllDone: function(result){
@@ -558,7 +765,7 @@ function startStream(url, callbacks) {
           else if (d.type === 'done' && callbacks.onDone) callbacks.onDone(d.result);
           else if (d.type === 'error' && callbacks.onError) callbacks.onError(d.msg);
           else if (d.type === 'all_log' && callbacks.onLog) callbacks.onLog(d.line, d.progress, d.key);
-          else if (d.type === 'strategy_done' && callbacks.onStrategyDone) callbacks.onStrategyDone(d.key);
+          else if (d.type === 'strategy_done' && callbacks.onStrategyDone) callbacks.onStrategyDone(d.key, d.result);
           else if (d.type === 'all_done' && callbacks.onAllDone) callbacks.onAllDone(d.result);
         });
         pump();
@@ -591,6 +798,63 @@ function resetSingleBtns() {
 }
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ---- 股票快照K线图 ----
+var chartCache = {};
+var chartHoverTimer = null;
+var leaveTimer = null;
+var modalHovered = false;
+
+function openChart(code, name) {
+  var modal = document.getElementById('chartModal');
+  // 如果当前modal已经显示同一只股票，不重复请求
+  var curCode = document.getElementById('modalTitle').getAttribute('data-chart-code');
+  if (curCode === code && modal.classList.contains('show')) return;
+
+  document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(name) + '<span class="m-code">' + code + '</span>';
+  document.getElementById('modalTitle').setAttribute('data-chart-code', code);
+  var img = document.getElementById('modalImg');
+  img.style.display = 'none';
+  img.classList.remove('loaded');
+  document.getElementById('modalLoader').style.display = '';
+  document.getElementById('modalErr').style.display = 'none';
+  modal.classList.add('show');
+
+  if (chartCache[code]) {
+    // 使用缓存
+    img.src = chartCache[code].image;
+    document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(chartCache[code].name) + '<span class="m-code">' + code + '</span>';
+    return;
+  }
+
+  fetch('/api/chart/' + code)
+    .then(function(r){ if(!r.ok) return r.json().then(function(d){ throw new Error(d.error||'请求失败') }); return r.json(); })
+    .then(function(d){
+      chartCache[code] = d;
+      // 检查是否还在看同一只
+      if (document.getElementById('modalTitle').getAttribute('data-chart-code') === code) {
+        img.src = d.image;
+        document.getElementById('modalTitle').innerHTML = '<span style="color:var(--accent)">\uD83D\uDCC8</span> ' + esc(d.name) + '<span class="m-code">' + d.code + '</span>';
+      }
+    }).catch(function(e){
+      document.getElementById('modalLoader').style.display = 'none';
+      document.getElementById('modalErr').style.display = '';
+      document.getElementById('modalErr').textContent = '生成快照失败: ' + esc(e.message);
+    });
+}
+
+function closeModal() {
+  var modal = document.getElementById('chartModal');
+  modal.classList.remove('show');
+  // 延迟清理图片src，让关闭动画先播放
+  setTimeout(function() {
+    if (!modal.classList.contains('show')) {
+      document.getElementById('modalImg').src = '';
+      document.getElementById('modalImg').classList.remove('loaded');
+      document.getElementById('modalTitle').removeAttribute('data-chart-code');
+    }
+  }, 450);
+}
 
 // ---- 精致 K 线图动画 ----
 (function initChart(){
@@ -658,6 +922,21 @@ function tick(){
 }
 setInterval(tick,1000); tick();
 </script>
+<!-- 模态弹窗 -->
+<div class="modal-overlay" id="chartModal" onclick="if(event.target===this)closeModal()"
+    onmouseenter="modalHovered=true;clearTimeout(leaveTimer)"
+    onmouseleave="modalHovered=false;leaveTimer=setTimeout(function(){if(!modalHovered)closeModal()},250)">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <div class="modal-title" id="modalTitle"></div>
+    <div class="modal-content">
+      <div class="modal-loader" id="modalLoader"><div class="modal-spinner"></div></div>
+      <img class="modal-chart-img" id="modalImg" alt="K线图" style="display:none" onload="this.style.display='block';this.classList.add('loaded');document.getElementById('modalLoader').style.display='none'">
+      <div class="modal-error" id="modalErr" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>"""
 
