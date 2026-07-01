@@ -81,7 +81,7 @@ python app.py
 
 浏览器打开 `http://127.0.0.1:5000`
 
-![Web Dashboard 截图](dashboard_screenshot.png)
+![Web Dashboard 截图](2026-07-01 222903.png)
 
 ### 独立运行策略
 
