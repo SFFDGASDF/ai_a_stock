@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stock_utils import (
+from core.stock_utils import (
     get_client, get_stock_list, calc_technical_indicators,
     detect_volume_price_divergence, calc_atr_stop,
     calc_true_rps,

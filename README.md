@@ -1,146 +1,145 @@
-# 🐂 AI A-Stock 短线量化分析系统 V4.2
+# AI A-Stock 短线量化分析系统 V4.3
 
-> ⚠️ **风险警示：本系统仅供技术学习与研究参考，不构成任何投资建议。股票投资有风险，入市需谨慎。历史回测与实时扫描数据不代表未来表现。使用者须自行承担全部交易风险。**
+> **风险警示：本系统仅供技术学习与研究参考，不构成任何投资建议。股票投资有风险，入市需谨慎。历史回测与实时扫描数据不代表未来表现。使用者须自行承担全部交易风险。**
 
-基于 Python 的 A 股 T+1 隔日交易选股系统。内置**四策略体系** + Web 可视化仪表盘 + 统一回测框架 + 全市场扫描 + 市场情绪检测 + 真实RPS + 基本面过滤。
+基于 Python 的 A 股 T+1 隔日交易选股系统。内置**四策略体系** + Web 可视化仪表盘 + 统一回测框架 + **策略进化引擎**（数据库记录、绩效追踪、因子IC分析、权重自动优化）。
 
 ---
 
-## 📦 环境依赖
+## 环境依赖
 
 ```bash
-pip install pandas numpy stockstats mootdx requests flask matplotlib mplfinance
+pip install -r requirements.txt
 ```
 
 | 库 | 用途 |
 |---|---|
-| `mootdx` (tdxpy) | 通达信 TCP 行情数据（实时行情 + K线） |
+| `mootdx` | 通达信 TCP 行情数据（实时行情 + K线） |
 | `stockstats` | 技术指标计算（RSI / MACD / KDJ / BOLL） |
 | `flask` | Web 仪表盘后端 |
 | `matplotlib` + `mplfinance` | K线快照图生成 |
-| `pandas` | 数据处理 |
+| `pandas` / `numpy` | 数据处理与数值计算 |
+| `scipy` | Spearman 秩相关 / 因子IC分析 |
 | `requests` | HTTP API（东财/腾讯/同花顺） |
 
 ---
 
-## 🗂️ 项目结构
+## 项目结构
 
 ```
 ai_a_stock/
-├── strategies/                        # V4 策略（核心）
-│   ├── momentum_v4.py                 # 动量策略：追今日涨幅3-7%的强势股
-│   ├── oversold_v4.py                 # 超跌反弹：抄今日大跌2-8%的反弹
-│   ├── volume_price_resonance_v4.py   # 量价共振：放量+主力流入+趋势三确认
-│   └── breakout_strategy.py           # 均线突破：放量突破MA20/MA60启动信号
+├── app.py                             # 主入口: python app.py
+├── requirements.txt                   # 依赖清单
+├── .env.example                       # 环境变量模板
+├── .gitignore
+├── README.md
 │
-├── web_dashboard.py                   # Web 可视化仪表盘（Flask + SSE + Jinja2）
-├── stock_utils.py                     # 公共模块（行情/指标/换手/资金/情绪/基本面/RPS）
+├── core/                              # —— 核心库
+│   ├── config.py                      #   配置中心（所有可调参数）
+│   ├── logging_config.py              #   统一日志
+│   ├── stock_utils.py                 #   行情 / 技术指标 / 资金 / 情绪 / RPS
+│   ├── db_manager.py                  #   SQLite 数据库（选股入库 + 绩效 + 权重）
+│   ├── performance_tracker.py         #   T+N 绩效追踪与统计
+│   ├── strategy_optimizer.py          #   因子IC分析 + 权重自动优化
+│   └── scheduler.py                   #   后台调度引擎（定时追踪 + 自动优化）
 │
-├── backtest/
-│   └── backtest_framework.py          # 统一回测框架（滚动窗口+胜率+盈亏比+IC分析）
+├── web/                               # —— Web 应用
+│   ├── dashboard.py                   #   Flask 后端（SSE + API + K线图）
+│   └── templates/
+│       └── dashboard.html             #   仪表盘前端模板
 │
-├── tools/                             # 辅助工具
-│   ├── draw_kline.py                  # K线图生成
-│   ├── draw_kline_interactive.py      # 交互式K线图（Plotly）
-│   ├── ths_hot.py                     # 同花顺当日强势股列表
-│   ├── pick_stock.py                  # 今日强势股筛选
-│   └── deep_compare.py                # 候选股深度对比分析
+├── strategies/                        # —— 四策略
+│   ├── momentum_v4.py                 #   动量策略：追涨幅3-7%的强势股
+│   ├── oversold_v4.py                 #   超跌反弹：抄跌幅2-8%的反弹
+│   ├── volume_price_resonance_v4.py   #   量价共振：放量+主力流入+趋势确认
+│   └── breakout_strategy.py           #   均线突破：放量突破MA20/MA60启动信号
 │
-├── legacy/                            # V3 策略（参考保留）
-│   ├── momentum_v3.py
-│   ├── oversold_v3.py
-│   ├── enhanced_score.py
-│   ├── score_stocks.py
-│   └── backtest_score.py
+├── backtest/                          # —— 回测框架
+│   └── backtest_framework.py
 │
-├── .claude/skills/a-stock-data/       # Claude Code Skill
-├── charts/                            # K线图输出
-└── README.md
+├── tools/                             # —— 辅助工具
+│   ├── draw_kline.py                  #   K线图生成
+│   ├── draw_kline_interactive.py      #   交互式K线图（Plotly）
+│   ├── ths_hot.py                     #   同花顺当日强势股列表
+│   ├── pick_stock.py                  #   今日强势股筛选
+│   └── deep_compare.py                #   候选股深度对比分析
+│
+├── legacy/                            # —— 历史版本（参考保留）
+└── charts/                            # —— K线图输出
 ```
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-### 动量策略 V4（追强势股）
-```bash
-python strategies/momentum_v4.py
-```
-- 全市场扫描今日涨幅 3-7% 的股票
-- 13因子评分：均线排列 + RSI + MACD + 量能 + 真实RPS + 行业动量 + 基本面
-- 市场情绪 Gate（炸板率>35% 直接退出）
-- 输出 TOP15 + ATR止损 + 最终推荐
-
-### 超跌反弹 V4（抄底）
-```bash
-python strategies/oversold_v4.py
-```
-- 全市场扫描今日跌幅 2-8% 的股票
-- 11因子评分：超跌深度 + 下影线 + 均线支撑 + RSI超卖 + 低位放量
-- 跌停>50家自动退出（恐慌不抄底）
-
-### 量价共振 V4（三维确认）
-```bash
-python strategies/volume_price_resonance_v4.py
-```
-- 量价配合 + 主力资金流入 + 趋势向上 三重共振
-- 高位放量危险检测（BOLL>85%+量比>1.5）
-
-### 均线突破 V1（启动信号）
-```bash
-python strategies/breakout_strategy.py
-```
-- 放量突破 MA20/MA60 的启动信号捕捉
-- 9因子评分：突破强度 + 量能确认 + 资金共振 + RPS
-
-### 回测验证
-```bash
-python backtest/backtest_framework.py
-```
-- 滚动窗口回测 + 信号vs噪声对比 + 分数段细分 + Spearman秩相关
-
----
-
-## 🌐 Web 可视化仪表盘
-
-一键启动带实时进度动画的策略仪表盘，四策略并行 / 综合选股 / SSE 实时日志推流：
+### 一键启动 Web 仪表盘
 
 ```bash
-pip install flask
-python web_dashboard.py
+pip install -r requirements.txt
+python app.py
 ```
 
 浏览器打开 `http://127.0.0.1:5000`
 
-![Web Dashboard 截图](20260701152237.jpg)
+### 独立运行策略
 
-### 仪表盘功能
-
-| 功能 | 说明 |
-|------|------|
-| **综合选股** | 一键顺序运行全部四个策略，自动去重合并，标注每只股票来源策略 |
-| **单策略运行** | 独立运行动量/超跌/量价共振/均线突破，查看各策略专属结果 |
-| **实时日志流** | SSE (Server-Sent Events) 实时推流策略 stdout，无需刷新页面 |
-| **K线蜡烛动画** | 等待结果时展示动态 K 线图（蜡烛弹跳 + MA 均线描边 + 价格跳动 + 浮动粒子） |
-| **K线快照弹窗** | 点击表格任意股票行弹出 60日K线 + MA均线 + 成交量快照图（mplfinance 渲染） |
-| **进度条** | 四个策略独立彩色进度条，7 步进度精确反馈 |
-| **推荐卡片** | 最终推荐股票独立卡片展示（现价/涨跌/目标价/止损/换手/RPS/PE） |
-| **结果表格** | 完整的候选股排序表格（支持综合/各策略标签切换）+ Hero区联动展示TOP1 |
-| **深色主题** | 专业交易终端风格深色 UI，自适应布局 |
-
-### 架构说明
-
-- **单文件部署**：`web_dashboard.py` 包含 Flask 后端 + Jinja2 HTML 模板 + 前端 JS
-- **进程内线程执行**：策略脚本通过 `exec()` 在守护线程中运行，`_LineWriter` 重定向 stdout 实现实时日志流
-- **通用解析器**：`parse_strategy_output` 正则解析所有四种策略的输出格式
-- **综合选股流程**：顺序执行 → 去重合并 → 按评分排序 → 标注来源
-- **K线快照**：`/api/chart/<code>` 端点通过 mplfinance 生成 60日K线图（红涨绿跌 + MA5/10/20 + 成交量），base64 编码返回
+```bash
+python strategies/momentum_v4.py       # 动量策略
+python strategies/oversold_v4.py       # 超跌反弹
+python strategies/volume_price_resonance_v4.py  # 量价共振
+python strategies/breakout_strategy.py # 均线突破
+python backtest/backtest_framework.py  # 回测验证
+```
 
 ---
 
-## 🛡️ V4 核心能力
+## Web 仪表盘功能
+
+| 功能 | 说明 |
+|------|------|
+| **综合选股** | 一键顺序运行四个策略，去重合并，标注来源 |
+| **单策略运行** | 独立运行各策略，查看专属结果 |
+| **实时日志流** | SSE 实时推流策略 stdout，无需刷新 |
+| **K线蜡烛动画** | 等待时展示动态K线图（蜡烛弹跳 + MA描边 + 浮动粒子） |
+| **K线快照弹窗** | 点击股票行弹出 60日K线 + MA均线 + 成交量 |
+| **推荐卡片** | 最终推荐独立卡片（现价/目标/止损/换手/RPS/PE） |
+| **结果表格** | 候选股排序表格 + 标签切换 + Hero区联动TOP1 |
+| **绩效面板** | 各策略胜率/收益率/盈亏比 + 因子IC分析 + 最近表现 |
+| **进化引擎** | 数据库自动记录 → 绩效追踪 → 因子分析 → 权重优化 |
+
+---
+
+## 策略进化引擎 (V4.3 新增)
+
+### 工作流程
+
+```
+策略运行 → 结果自动入库 (SQLite)
+       ↓
+  Scheduler 每小时检测
+       ↓
+绩效追踪器 回查 T+1~T+5 实际收益率
+       ↓
+  积累 ≥30 条新数据 → 自动触发优化
+       ↓
+  IC分析 + 权重缩放 / 网格搜索 → 因子权重写入数据库
+```
+
+### 核心模块
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| 数据库 | `core/db_manager.py` | SQLite 4表：strategy_runs / stock_picks / pick_performance / factor_weights |
+| 绩效追踪 | `core/performance_tracker.py` | 通过 mootdx 回查历史选股实际 T+N 表现 |
+| 策略优化 | `core/strategy_optimizer.py` | Spearman 秩相关 IC 分析 + IC 缩放 + 网格搜索 |
+| 后台调度 | `core/scheduler.py` | 每 60 分钟自动追踪绩效，积累数据后自动优化 |
+
+---
+
+## V4 核心能力
 
 ### 市场情绪 Gate（策略启动前检测）
+
 | 指标 | 阈值 | 动作 |
 |------|------|------|
 | 炸板率 | > 35% | 动量/量价/突破 直接退出 |
@@ -149,6 +148,7 @@ python web_dashboard.py
 | 涨停家数 | < 20 | 动量策略警告 |
 
 ### 基本面过滤（全策略通用）
+
 | 条件 | 动作 |
 |------|------|
 | PE < 0 或 PE > 200 | 排除 |
@@ -156,18 +156,17 @@ python web_dashboard.py
 | 市值 < 20亿 / < 30亿 | 排除 |
 
 ### 真实 RPS
+
 - 基于全市场20日涨幅排名百分位
 - RPS ≥ 85: +8分 | RPS < 30: -6分
 
 ### ATR 动态止损
-- 止损距离 = 1.5 × ATR14，限幅 2%-5%
 
-### 安全门
-各策略最终推荐前通过多重安全检查（量比/RSI/乖离/连涨/连阴/上影线/RPS），不通过则拒绝推荐。
+- 止损距离 = 1.5 × ATR14，限幅 2%-5%
 
 ---
 
-## 📊 V4 策略对比
+## 策略对比
 
 | 策略 | 选股逻辑 | 评分因子 | 适合行情 |
 |------|---------|---------|---------|
@@ -178,7 +177,7 @@ python web_dashboard.py
 
 ---
 
-## 📝 数据源
+## 数据源
 
 | 数据 | 来源 |
 |------|------|
@@ -192,76 +191,62 @@ python web_dashboard.py
 
 ---
 
-## 🚨 风险告知与免责声明（请务必阅读）
+## 配置管理
 
-### 核心风险警示
+所有可调参数集中在 `core/config.py`：
+
+- **服务器**: FLASK_HOST / FLASK_PORT
+- **行情扫描**: QUOTE_BATCH_SIZE / 各策略筛选阈值
+- **安全门**: SAFE_GATE 字典（四策略独立配置）
+- **止损**: ATR_MULTIPLIER / ATR_STOP_MIN_PCT / ATR_STOP_MAX_PCT
+- **调度**: SCHEDULER_CHECK_INTERVAL / OPTIMIZE_THRESHOLD
+- **优化**: OPTIMIZE_MIN_SAMPLES / OPTIMIZE_LEARNING_RATE
+
+支持通过 `.env` 文件或环境变量覆盖（参考 `.env.example`）。
+
+---
+
+## 风险告知与免责声明
 
 > **本系统输出的任何选股结果、评分、推荐均不构成投资建议。使用者须独立判断，自负盈亏。**
 
 | 风险类别 | 具体说明 |
 |----------|----------|
-| **市场风险** | 任何股票价格均可能大幅波动，存在本金全部损失的可能 |
-| **模型风险** | 策略基于纯技术面因子，不含财报/政策/行业消息/主力意图等关键信息 |
-| **回测误导** | 历史回测收益不代表未来表现，过去有效的因子可能在未来失效 |
-| **数据延迟** | 实时行情存在秒级延迟，尤其是极端行情下数据可能不准确 |
-| **API 不稳定** | 东方财富等第三方数据源可能出现拒绝连接或字段缺失，导致结果偏差 |
-| **过拟合风险** | 多因子评分体系可能对历史数据过拟合，实战中表现可能低于预期 |
-| **黑天鹅事件** | 策略无法预测突发利空（财务造假/监管处罚/地缘政治等） |
-| **流动性风险** | 小市值个股可能出现流动性枯竭，导致无法按预期价格成交 |
+| **市场风险** | 任何股票价格均可能大幅波动 |
+| **模型风险** | 策略基于纯技术面因子 |
+| **回测误导** | 历史回测收益不代表未来表现 |
+| **数据延迟** | 行情存在秒级延迟 |
+| **API 不稳定** | 第三方数据源可能出现拒绝连接 |
+| **过拟合风险** | 多因子评分可能对历史过拟合 |
 
-### 免责声明
-
-1. **本系统及相关代码（以下简称"本工具"）仅供技术学习与研究参考，严禁用于实盘交易决策。**
-2. 本工具的开发者、贡献者、分发者**不承担**使用者因使用本工具而产生的任何直接或间接损失。
-3. 股票/基金/衍生品投资存在高风险，**可能造成超过本金的损失**，入市前应充分了解相关风险。
-4. 本工具的选股逻辑、评分算法、止损建议等**不能替代**持牌金融机构的专业投资建议。
-5. 使用者应在**完全理解策略逻辑与局限**的前提下，结合自身风险承受能力独立作出投资决策。
-6. 本工具不对数据的**准确性、完整性、及时性**做任何保证。
-7. 过去的表现（包括回测结果）**绝不预示**未来收益。
-
-> 🔴 **简而言之：本工具是学习量化编程的练手项目，不是帮你赚钱的工具。用它做交易，亏了别找我。**
+> **本工具是学习量化编程的练手项目，不是帮你赚钱的工具。用它做交易，亏了别找我。**
 
 ---
 
-## 📋 更新日志
+## 更新日志
+
+### V4.3 — 策略进化 + 工程化重构
+
+- 新增 **策略进化引擎**：SQLite 数据库自动记录选股 → T+N 绩效追踪 → 因子 IC 分析 → 权重自动优化
+- 新增 **绩效面板**：各策略胜率/收益率/盈亏比 + 因子 IC 分析柱状图 + 最近选股表现
+- 新增 **后台调度器**：每 60 分钟自动追踪绩效，积累 30 条数据后自动触发优化
+- 新增 **统一配置管理** `core/config.py`，所有可调参数集中维护
+- 新增 **标准化日志** `core/logging_config.py`
+- **项目结构重构**：`core/`（核心库）+ `web/`（Web应用）分层架构，HTML 模板独立
+- 新增 `requirements.txt` / `.env.example` / `app.py` 统一入口
 
 ### V4.2 — K线快照 + 引擎优化
-- 新增 **K线快照弹窗**：点击表格股票行弹出 60日K线图（mplfinance 渲染，MA5/10/20 + 成交量）
-- 策略引擎改为**进程内线程执行**（`exec()` + 守护线程），解决 Windows 沙箱 `subprocess.Popen` WinError 5 限制
-- 修复量价共振策略 `ind["upper_shadow"]` KeyError（字段归属修正为 `cand["upper_shadow"]`）
-- 放宽量价共振 vr 阈值（API 数据不可用时阈值从 1.5 降至 0.5）
-- K线弹窗支持 chartCache 缓存（二次悬停即时显示）
-- CSS 过渡动画：遮罩淡入 + 卡片弹簧展开 + 图片渐显
 
-### V4.1 — Web 仪表盘 + UI 增强
+- 新增 K线快照弹窗（mplfinance 渲染 60日K线 + MA5/10/20 + 成交量）
+- 策略引擎改为进程内线程执行（`exec()` + 守护线程）
+- 修复量价共振 `upper_shadow` KeyError / 放宽 vr 阈值
+- K线弹窗缓存 + CSS 过渡动画
+
+### V4.1 — Web 仪表盘
+
 - 新增 Web 可视化仪表盘（Flask SSE 实时推流）
-- 综合选股：一键运行四策略，自动去重合并
-- K线蜡烛动画（动态蜡烛弹跳 + MA 均线描边 + 浮动粒子）
-- 独立彩色进度条 + 实时日志流
-- 推荐卡片 + 可切换标签结果表格
-- 修复超跌/量价策略 `pb=0` 误过滤（API 数据不可用时跳过过滤）
-- 修复解析器仅识别 `RSI14` 的 Bug（扩展至 RSI6/量比/换手等 12 关键词）
-- 修复「今日跌幅」推荐解析缺失
-- 深色主题 + SSE UTF-8 编码适配
+- 综合选股 + K线蜡烛动画 + 进度条 + 推荐卡片
 
 ### V4.0 — 全面升级
-- 新增市场情绪 Gate（涨停/跌停/炸板率/市场温度）
-- 新增真实 RPS（全市场排名百分位）
-- 新增基本面过滤（PE/PB/市值）
-- 新增行业动量排名
-- 新增均线突破策略
-- 新增统一回测框架
-- 修复 get_extra_data_batch API（多页拉取+日缓存）
-- 所有策略升级多因子评分体系
-- 项目结构重组（strategies/core/backtest/tools/legacy）
 
-### V3.0 — 策略升级
-- 动量策略 V3 + 超跌策略 V3 + 量价共振策略
-- stock_utils.py 公共模块（换手率/资金流向/技术指标/量价背离/ATR止损）
-- 大盘环境检测（涨跌比统计）
-
-### V2.0 — 安全版
-- 安全惩罚系统 + 风险标签 + 安全门机制
-
-### V1.0 — 初始版本
-- 动量策略 + 超跌反弹 + 多因子评分 + K线可视化
+- 市场情绪 Gate + 真实 RPS + 基本面过滤 + 行业动量 + 均线突破策略

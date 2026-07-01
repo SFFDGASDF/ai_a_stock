@@ -1,2 +1,21 @@
 __pycache__/
 .qoder/
+
+# 数据库文件
+*.db
+
+# 环境变量
+.env
+
+# 数据目录
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件
+_extract*.py
+_fix*.py

@@ -1,297 +1,4 @@
-"""
-A股策略可视化仪表盘 v3 — 综合选股 + 进度动画 + 协调UI
-"""
-import json, sys, os, time, threading, queue, re, itertools, io, base64
-from flask import Flask, Response, render_template_string, jsonify
-
-app = Flask(__name__)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STRATEGIES_DIR = os.path.join(BASE_DIR, "strategies")
-
-STRATEGIES = {
-    "momentum":    {"name": "动量策略", "file": "momentum_v4.py",    "icon": "\U0001f680", "color": "#ff6b6b"},
-    "oversold":    {"name": "超跌反弹", "file": "oversold_v4.py",    "icon": "\U0001f4c9", "color": "#48dbfb"},
-    "volume_price":{"name": "量价共振", "file": "volume_price_resonance_v4.py", "icon": "\U0001f4ca", "color": "#feca57"},
-    "breakout":    {"name": "均线突破", "file": "breakout_strategy.py","icon": "\U0001f53a", "color": "#00d2a0"},
-}
-
-ALL_ORDER = ["momentum", "oversold", "volume_price", "breakout"]
-_run_status = {}
-_run_lock = threading.Lock()
-
-
-def parse_strategy_output(lines):
-    result = {"market_env": "", "sentiment": "", "stocks": [], "recommendation": None}
-    stock_re = re.compile(r"#(\d+)\s+(.+?)\((\d{6})\)\s+([\d.]+)\s+今日([+-][\d.]+)%\s+评分(\d+)")
-
-    for line in lines:
-        ls = line.strip()
-        if not ls: continue
-        if "大盘:" in ls and "情绪:" in ls: result["market_env"] = ls
-        if "涨停" in ls and ("炸板率" in ls or "温度" in ls): result["sentiment"] = ls
-        if "最终推荐:" in ls:
-            m = re.search(r"最终推荐:\s*(.+?)\((\d{6})\)\s*(\d+)/100", ls)
-            if m: result["recommendation"] = {"name": m.group(1), "code": m.group(2), "score": int(m.group(3))}
-        if result["recommendation"]:
-            rc = result["recommendation"]
-            for pat, key in [(r"现价:\s*([\d.]+)","price"),(r"今日涨幅:\s*([+-][\d.]+)%","chg"),
-                             (r"今日跌幅:\s*([-][\d.]+)%","chg"),
-                             (r"换手率:\s*([\d.]+)%","turnover"),(r"RPS20:\s*([\d.]+)","rps20"),
-                             (r"PE:\s*([\d.]+)","pe")]:
-                m = re.search(pat, ls)
-                if m: rc[key] = float(m.group(1))
-            m = re.search(r"目标:\s*([\d.]+).*?([\d.]+)", ls)
-            if m: rc["target_low"] = float(m.group(1)); rc["target_high"] = float(m.group(2))
-            m = re.search(r"止损:\s*([\d.]+)", ls)
-            if m: rc["stop_price"] = float(m.group(1))
-
-        sm = stock_re.match(ls)
-        if sm:
-            result["stocks"].append({"rank":int(sm.group(1)),"name":sm.group(2).strip(),
-                "code":sm.group(3),"price":float(sm.group(4)),"chg":float(sm.group(5)),
-                "score":int(sm.group(6)),"source":""})
-        elif result["stocks"] and any(kw in ls for kw in ["RSI","量比","换手","RPS","PE","BOLL","大单","涨停基因","乖离","下影","MA5","MA20","MACD"]):
-            last = result["stocks"][-1]
-            for pat, key in [(r"RSI6=([\d.]+)","rsi6"),(r"RSI14=([\d.]+)","rsi14"),
-                             (r"量比=([\d.]+)x","volume_ratio"),(r"换手=([\d.]+)%","turnover"),
-                             (r"RPS20=([\d.]+)","rps20"),(r"乖离=([\d.]+)%","deviation"),
-                             (r"涨停基因=(\d+)次","limit_up_count"),(r"PE=([\d.]+)","pe"),
-                             (r"BOLL=([\d.]+)%","boll_pos")]:
-                m2 = re.search(pat, ls)
-                if m2: last[key] = float(m2.group(1))
-            m3 = re.search(r"大单=(\d+)万", ls)
-            if m3: last["main_net"] = float(m3.group(1))
-    return result
-
-
-class _LineWriter:
-    """自定义stdout，将每行输出放入队列实现实时流式传输"""
-    def __init__(self, q):
-        self.q = q
-        self._buf = ""
-    def write(self, s):
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self.q.put(line)
-    def flush(self):
-        if self._buf:
-            self.q.put(self._buf)
-            self._buf = ""
-
-
-def run_strategy_stream(strategy_key):
-    info = STRATEGIES[strategy_key]
-    script = os.path.join(STRATEGIES_DIR, info["file"])
-    with _run_lock: _run_status[strategy_key] = {"running":True,"progress":0,"done":False}
-    def emit(etype,**kw): return f"data: {json.dumps(dict(type=etype,**kw),ensure_ascii=False)}\n\n"
-    try:
-        q = queue.Queue()
-        writer = _LineWriter(q)
-        error_occurred = {"flag": False, "msg": ""}
-
-        def _run_script():
-            old_stdout = sys.stdout
-            old_cwd = os.getcwd()
-            sys.stdout = writer
-            os.chdir(BASE_DIR)
-            try:
-                with open(script, "r", encoding="utf-8") as sf:
-                    code = compile(sf.read(), script, "exec")
-                exec(code, {"__name__": "__main__", "__file__": script})
-            except Exception as e:
-                import traceback
-                error_occurred["flag"] = True
-                error_occurred["msg"] = str(e)
-                traceback.print_exc()
-            finally:
-                sys.stdout = old_stdout
-                os.chdir(old_cwd)
-                writer.flush()
-                q.put(None)
-
-        t = threading.Thread(target=_run_script, daemon=True)
-        t.start()
-
-        all_lines = []; last_p = 0
-        while True:
-            try:
-                line = q.get(timeout=0.2)
-            except queue.Empty:
-                if not t.is_alive():
-                    try: line = q.get_nowait()
-                    except queue.Empty: break
-                continue
-            if line is None:
-                break
-            if error_occurred["flag"]:
-                yield emit("error", msg=error_occurred["msg"])
-                break
-            all_lines.append(line)
-            progress = last_p
-            if "[0/7]" in line: progress = 5
-            elif "[1/7]" in line: progress = 10
-            elif "[2/7]" in line: progress = 20
-            elif "[3/7]" in line: progress = 30
-            elif "[4/7]" in line: progress = 45
-            elif "[5/7]" in line: progress = 60
-            elif "[6/7]" in line: progress = 80
-            elif "[7/7]" in line: progress = 90
-            elif "最终推荐" in line: progress = 95
-            elif "以上为技术面分析" in line: progress = 100
-            if progress > last_p: last_p = progress
-            with _run_lock: _run_status[strategy_key] = {"running":True,"progress":progress,"done":False}
-            yield emit("log", line=line, progress=progress)
-
-        t.join(timeout=5)
-        if error_occurred["flag"]:
-            with _run_lock: _run_status[strategy_key] = {"running":False,"progress":0,"done":True,"error":error_occurred["msg"]}
-            yield emit("error", msg=error_occurred["msg"])
-        else:
-            result = parse_strategy_output(all_lines)
-            with _run_lock: _run_status[strategy_key] = {"running":False,"progress":100,"done":True,"result":result}
-            yield emit("done", result=result)
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        yield emit("error", msg=str(e))
-        with _run_lock: _run_status[strategy_key] = {"running":False,"progress":0,"done":True,"error":str(e)}
-
-
-@app.route("/")
-def index():
-    return render_template_string(DASHBOARD_HTML, strategies=STRATEGIES, all_order=ALL_ORDER)
-
-
-@app.route("/api/run/<strategy_key>")
-def api_run(strategy_key):
-    if strategy_key not in STRATEGIES: return jsonify({"error":"unknown"}), 404
-    return Response(run_strategy_stream(strategy_key), mimetype="text/event-stream; charset=utf-8",
-        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"})
-
-
-@app.route("/api/run-all")
-def api_run_all():
-    """综合选股: 顺序运行全部4个策略, 合并结果"""
-    def generate():
-        merged = {"stocks": [], "recommendations": [], "market_env": "", "sentiment": "", "total": 4, "done_count": 0}
-        yield f"data: {json.dumps({'type':'all_start','total':4},ensure_ascii=False)}\n\n"
-        for idx, key in enumerate(ALL_ORDER):
-            info = STRATEGIES[key]
-            yield f"data: {json.dumps({'type':'strategy_start','key':key,'name':info['name'],'icon':info['icon'],'color':info['color'],'idx':idx+1,'total':4},ensure_ascii=False)}\n\n"
-            for chunk in run_strategy_stream(key):
-                if chunk.startswith("data: "):
-                    try:
-                        data = json.loads(chunk[6:])
-                        if data.get("type") == "log":
-                            yield f"data: {json.dumps({'type':'all_log','key':key,'line':data['line'],'progress':data['progress']},ensure_ascii=False)}\n\n"
-                        elif data.get("type") == "done":
-                            r = data.get("result", {})
-                            merged["market_env"] = r.get("market_env") or merged["market_env"]
-                            merged["sentiment"] = r.get("sentiment") or merged["sentiment"]
-                            # 标记来源并合并
-                            for s in r.get("stocks", []):
-                                s["source"] = info["icon"] + " " + info["name"]
-                            merged["stocks"].extend(r.get("stocks", []))
-                            if r.get("recommendation"):
-                                r["recommendation"]["source_key"] = key
-                                r["recommendation"]["source_name"] = info["name"]
-                                r["recommendation"]["source_icon"] = info["icon"]
-                                merged["recommendations"].append(r["recommendation"])
-                            merged["done_count"] = idx + 1
-                            yield f"data: {json.dumps({'type':'strategy_done','key':key,'done_count':idx+1,'total':4,'result':r},ensure_ascii=False)}\n\n"
-                    except: pass
-        # 去重、排序合并结果
-        seen = set()
-        uniq_stocks = []
-        for s in merged["stocks"]:
-            if s["code"] not in seen:
-                seen.add(s["code"])
-                uniq_stocks.append(s)
-        uniq_stocks.sort(key=lambda x: x["score"], reverse=True)
-        merged["stocks"] = uniq_stocks[:60]
-        merged["recommendations"].sort(key=lambda x: x["score"], reverse=True)
-        merged["all_done"] = True
-        yield f"data: {json.dumps({'type':'all_done','result':merged},ensure_ascii=False)}\n\n"
-    return Response(generate(), mimetype="text/event-stream; charset=utf-8",
-        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"})
-
-
-@app.route("/api/chart/<code>")
-def api_chart(code):
-    """股票快照行情图: K线(60日) + 均线 + 成交量, 返回base64 PNG"""
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.font_manager as fm
-        # 中文字体: 必须在 import pyplot 之前设置，清除缓存确保生效
-        try: fm._load_fontmanager(try_read_cache=False)
-        except: pass
-        font_paths = [
-            'C:/Windows/Fonts/msyh.ttc',   # 微软雅黑
-            'C:/Windows/Fonts/simsun.ttc',  # 宋体
-            'C:/Windows/Fonts/simhei.ttf',  # 黑体
-        ]
-        for fp in font_paths:
-            if os.path.exists(fp):
-                fm.fontManager.addfont(fp)
-                break
-        # 使用英文标签, 避免中文字体缺失导致缺字
-        matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
-        matplotlib.rcParams['axes.unicode_minus'] = False
-
-        import matplotlib.pyplot as plt
-        import mplfinance as mpf
-        import pandas as pd
-        from mootdx.quotes import Quotes
-        from stock_utils import calc_technical_indicators
-        client = Quotes.factory(market='std')
-
-        bars = client.bars(symbol=code, category=4, offset=70)
-        if bars is None or len(bars) < 20:
-            return jsonify({"error": "K线数据不足"}), 404
-
-        df = pd.DataFrame(bars)
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.set_index('datetime').sort_index()
-        df = df.rename(columns={'open':'Open','close':'Close','high':'High','low':'Low','vol':'Volume'})
-
-        ind = calc_technical_indicators(bars)
-        name = code  # 使用代码作为fallback
-        try:
-            from stock_utils import get_name_batch
-            nm = get_name_batch([code])
-            if nm: name = nm.get(code, code)
-        except: pass
-
-        chg_str = ""
-        if len(df) >= 2:
-            chg = (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
-            chg_str = f"{chg:+.1f}%"
-
-        colors = mpf.make_marketcolors(up='#ef4444',down='#22c55e',edge='inherit',wick='inherit',volume={'up':'#ef4444','down':'#22c55e'},alpha=0.8)
-        style = mpf.make_mpf_style(marketcolors=colors,gridcolor='#e5e7eb',facecolor='#fafafa',figcolor='#fafafa')
-
-        apds = [
-            mpf.make_addplot(df['Volume'],type='bar',width=0.7,alpha=0.35,color='#9ca3af',panel=1,secondary_y=False),
-        ]
-        fig, axes = mpf.plot(df, type='candle', style=style, mav=(5,10,20),
-                 volume=False, addplot=apds, panel_ratios=(3,1), figsize=(10,5.5),
-                 title=f"\n{code}  Price:{ind['cur']:.2f}  Chg:{chg_str}  RSI14:{ind['rsi14']:.0f}  Vol:{ind.get('vr',1):.1f}x",
-                 returnfig=True, warn_too_much_data=200)
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-        plt.close(fig)
-        buf.seek(0)
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-        return jsonify({"image": "data:image/png;base64," + img_b64, "name": name, "code": code})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -416,7 +123,22 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 .modal-chart-img{width:100%;border-radius:8px;opacity:0;transition:opacity .3s ease}
 .modal-chart-img.loaded{opacity:1}
 .modal-error{text-align:center;padding:40px;color:var(--red)}
-</style>
+/* ---- 绩效面板 ---- */
+.perf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:12px}
+.perf-stat{background:var(--card2);border-radius:8px;padding:12px;border:1px solid var(--border);text-align:center}
+.perf-stat .ps-val{font-size:22px;font-weight:700;margin:4px 0}
+.perf-stat .ps-label{font-size:10px;color:var(--dim)}
+.perf-stat .ps-sub{font-size:10px;color:var(--dim);margin-top:2px}
+.perf-bar-wrap{background:var(--border);border-radius:4px;height:6px;overflow:hidden;margin:4px 0}
+.perf-bar-fill{height:100%;border-radius:3px;transition:width .5s}
+.factor-row{display:flex;align-items:center;padding:6px 8px;border-bottom:1px solid rgba(35,48,68,.3);font-size:11px}
+.factor-row .f-name{flex:1;color:var(--text)}
+.factor-row .f-ic{width:60px;text-align:right;font-weight:600}
+.factor-row .f-w{width:80px;text-align:right}
+.opt-btn{padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:var(--text);cursor:pointer;font-size:11px;transition:all .2s;margin-right:6px}
+.opt-btn:hover{background:#1e3044;border-color:var(--accent)}
+.opt-btn.active-opt{background:rgba(72,219,251,.15);border-color:var(--accent);animation:glow 1.5s ease-in-out infinite}
+.sched-status{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--dim);padding:6px 0}</style>
 </head>
 <body>
 <div class="header">
@@ -474,7 +196,7 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
     <div id="recCardWrap" style="display:none"></div>
 
     <!-- 主内容区 -->
-    <div class="card" style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+    <div class="card" style="flex:1;display:flex;flex-direction:column">
       <div class="tab-row" id="tabRow"></div>
       <div class="scroll-box" style="overflow-x:auto">
         <!-- 精致 K 线动画 -->
@@ -506,6 +228,22 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
           <thead><tr><th>#</th><th>名称</th><th>代码</th><th>来源</th><th>现价</th><th>涨跌</th><th>评分</th><th>换手</th><th>RSI</th><th>PE</th><th>量比</th><th>RPS20</th></tr></thead>
           <tbody id="stockTbody"></tbody>
         </table>
+        <!-- 绩效面板 -->
+        <div id="perfPanel" style="display:none">
+          <div class="sched-status" id="schedStatus">
+            <span>\u{1F504} 进化引擎: <span id="schedRunning">检查中...</span></span>
+            <span>上次检查: <span id="schedLastCheck">--</span></span>
+            <span>上次优化: <span id="schedLastOpt">--</span></span>
+            <button class="opt-btn" onclick="checkPerfNow()">\u{1F50D} 追踪绩效</button>
+            <button class="opt-btn" onclick="optimizeNow()">\u{2699} 优化策略</button>
+          </div>
+          <div id="perfSummary" style="margin-bottom:12px"></div>
+          <div class="tab-row" style="margin-bottom:8px">
+            <button class="opt-btn active-opt" id="perfStratAll" onclick="switchPerfStrat('all')">全部</button>
+          </div>
+          <div id="perfDetail"></div>
+          <div id="perfRecents" style="margin-top:12px"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -538,6 +276,13 @@ var isRunning = false;
     b.onclick = function(){switchTab(k);};
     row.appendChild(b);
   });
+  // 绩效标签
+  var perfBtn = document.createElement('button');
+  perfBtn.className = 'tab';
+  perfBtn.id = 'tab-perf';
+  perfBtn.innerHTML = '\u{1F4CA} 绩效';
+  perfBtn.onclick = function(){switchTab('perf');};
+  row.appendChild(perfBtn);
 })();
 
 function switchTab(key) {
@@ -545,11 +290,17 @@ function switchTab(key) {
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
   var tb = document.getElementById('tab-'+key);
   if (tb) tb.classList.add('active');
-  showResult(key);
+  if (key === 'perf') {
+    showPerfPanel();
+  } else {
+    showResult(key);
+  }
 }
 
 function showResult(key) {
   var data = allResults[key];
+  // 隐藏绩效面板，显示选股结果
+  document.getElementById('perfPanel').style.display = 'none';
   // 更新 hero 顶部动画
   updateHero(key);
   if (!data || !data.stocks || data.stocks.length===0) {
@@ -598,9 +349,11 @@ function updateHero(key) {
   var numEl = document.getElementById('tickNum');
   var pctEl = document.getElementById('tickPct');
   var heroEl = document.getElementById('rightHero');
+  var chartBox = document.getElementById('chartBox');
 
   if (!data || !data.stocks || data.stocks.length === 0) {
-    // 默认状态
+    // 默认状态 → 显示动画
+    chartBox.style.display = '';
     titleEl.textContent = 'AI 量化选股引擎';
     scoreEl.style.display = 'none';
     heroEl.classList.remove('hero-slim');
@@ -615,6 +368,8 @@ function updateHero(key) {
     return;
   }
 
+  // 有结果 → 隐藏动画，显示数据
+  chartBox.style.display = 'none';
   var top = data.stocks[0];
   var info = (key !== 'all' && STRATEGIES[key]) ? STRATEGIES[key] : null;
   var icon = info ? info.icon+' ' : '';
@@ -673,6 +428,7 @@ function runSingle(key) {
   btn.classList.add('running');
   pw.style.display = ''; pb.style.width = '0%';
   document.getElementById('recCardWrap').style.display = 'none';
+  document.getElementById('chartBox').style.display = '';
   isRunning = true;
   startStream('/api/run/'+key, {
     onLog: function(line, prog){ addLog(line); pb.style.width = prog+'%'; },
@@ -699,6 +455,7 @@ function runAll() {
   allBtn.classList.add('running');
   allBtn.textContent = '运行中...';
   document.getElementById('recCardWrap').style.display = 'none';
+  document.getElementById('chartBox').style.display = '';
   isRunning = true;
   document.getElementById('sysStatus').innerHTML = '<span style="color:var(--yellow)">&#x25cf; 综合选股中</span>';
 
@@ -921,7 +678,159 @@ function tick(){
   document.getElementById('clock').textContent = n.toLocaleDateString('zh-CN')+' '+n.toLocaleTimeString('zh-CN');
 }
 setInterval(tick,1000); tick();
-</script>
+
+// ---- 绩效面板 ----
+var perfStratKey = 'all';
+
+function showPerfPanel() {
+  document.getElementById('stockTable').style.display = 'none';
+  document.getElementById('perfPanel').style.display = '';
+  document.getElementById('recCardWrap').style.display = 'none';
+  document.getElementById('chartBox').style.display = 'none';
+  loadPerfData();
+  loadSchedStatus();
+  // 初始化策略选择按钮
+  var row = document.getElementById('perfDetail').parentNode.querySelector('.tab-row');
+  row.innerHTML = '<button class="opt-btn active-opt" id="perfStratAll" onclick="switchPerfStrat(\'all\')">全部</button>';
+  for (var ki = 0; ki < ALL_ORDER.length; ki++) {
+    (function(k, s) {
+      var b = document.createElement('button');
+      b.className = 'opt-btn';
+      b.id = 'perfStrat-' + k;
+      b.innerHTML = s.icon + ' ' + s.name;
+      b.onclick = function() { switchPerfStrat(k); };
+      row.appendChild(b);
+    })(ALL_ORDER[ki], STRATEGIES[ALL_ORDER[ki]]);
+  }
+}
+
+function switchPerfStrat(key) {
+  perfStratKey = key;
+  var row = document.getElementById('perfDetail').parentNode.querySelector('.tab-row');
+  row.querySelectorAll('.opt-btn').forEach(function(b) { b.classList.remove('active-opt'); });
+  var active = row.querySelector(key === 'all' ? '#perfStratAll' : '#perfStrat-' + key);
+  if (active) active.classList.add('active-opt');
+  loadPerfData();
+}
+
+function loadPerfData() {
+  var url = perfStratKey === 'all' ? '/api/performance' : '/api/performance/' + perfStratKey;
+  fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.error) { document.getElementById('perfSummary').innerHTML = '<div style="color:var(--red);text-align:center;padding:20px">' + esc(d.error) + '</div>'; return; }
+    renderPerfSummary(d.stats || {});
+    renderPerfRecent(d.recent || []);
+  }).catch(function(e) {
+    document.getElementById('perfSummary').innerHTML = '<div style="color:var(--red);text-align:center;padding:20px">加载失败: ' + esc(String(e)) + '</div>';
+  });
+}
+
+function renderPerfSummary(stats) {
+  var colors = {momentum: '#ff6b6b', oversold: '#48dbfb', volume_price: '#feca57', breakout: '#00d2a0'};
+  var html = '<div class="perf-grid">';
+  for (var k in stats) {
+    if (!ALL_ORDER.includes(k) && k !== 'all') continue;
+    var s = stats[k];
+    var c = colors[k] || 'var(--accent)';
+    var wr = s.winrate_1d || 0;
+    var wrColor = wr >= 60 ? 'var(--green)' : wr >= 45 ? 'var(--yellow)' : 'var(--red)';
+    var name = STRATEGIES[k] ? STRATEGIES[k].icon + ' ' + STRATEGIES[k].name : k;
+    html += '<div class="perf-stat">' +
+      '<div class="ps-label">' + name + '</div>' +
+      '<div class="ps-val" style="color:' + c + '">' + (s.total_picks || 0) + '<span style="font-size:10px;color:var(--dim)"> 次</span></div>' +
+      '<div class="ps-sub">T+1胜率 <b style="color:' + wrColor + '">' + wr + '%</b></div>' +
+      '<div class="ps-sub">T+3胜率 <b>' + (s.winrate_3d || 0) + '%</b> | T+5胜率 <b>' + (s.winrate_5d || 0) + '%</b></div>' +
+      '<div style="margin-top:6px;font-size:9px;color:var(--dim)">' +
+        '平均T+1: ' + (s.avg_ret_1d||0).toFixed(2) + '% | T+3: ' + (s.avg_ret_3d||0).toFixed(2) + '% | T+5: ' + (s.avg_ret_5d||0).toFixed(2) + '%<br>' +
+        '盈亏比: ' + (s.profit_loss_ratio||0).toFixed(2) + (s.max_ret_5d ? ' | 最佳+5日: ' + s.max_ret_5d.toFixed(1) + '%' : '') +
+      '</div>' +
+    '</div>';
+  }
+  if (Object.keys(stats).length === 0) html += '<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--dim)">暂无绩效数据，运行策略并等待追踪后查看</div>';
+  html += '</div>';
+  document.getElementById('perfSummary').innerHTML = html;
+
+  // 因子分析
+  if (perfStratKey !== 'all') {
+    loadFactorAnalysis(perfStratKey);
+  } else {
+    document.getElementById('perfDetail').innerHTML = '';
+  }
+}
+
+function loadFactorAnalysis(key) {
+  fetch('/api/factors/' + key).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.error) return;
+    var ic = d.ic_analysis || [];
+    var html = '<div style="font-weight:700;font-size:12px;margin:8px 0 4px">因子IC分析 (' + (ic.length||0) + '样本)</div>';
+    if (ic.length === 0) {
+      html += '<div style="color:var(--dim);font-size:10px">数据不足，运行更多策略后自动分析</div>';
+    } else {
+      for (var i = 0; i < Math.min(ic.length, 10); i++) {
+        var f = ic[i];
+        var icColor = Math.abs(f.ic_1d) > 0.05 ? (f.ic_1d > 0 ? 'var(--green)' : 'var(--red)') : 'var(--dim)';
+        var barW = Math.min(100, Math.abs(f.ic_1d) * 500);
+        html += '<div class="factor-row">' +
+          '<span class="f-name">' + f.factor + '</span>' +
+          '<div class="perf-bar-wrap" style="flex:1;margin:0 8px"><div class="perf-bar-fill" style="width:' + barW + '%;background:' + icColor + '"></div></div>' +
+          '<span class="f-ic" style="color:' + icColor + '">IC=' + f.ic_1d.toFixed(3) + '</span>' +
+          '<span style="font-size:9px;color:var(--dim);width:30px;text-align:right">' + (f.significant ? '*' : '') + '</span>' +
+        '</div>';
+      }
+    }
+    document.getElementById('perfDetail').innerHTML = html;
+  }).catch(function(){});
+}
+
+function renderPerfRecent(recents) {
+  var html = '<div style="font-weight:700;font-size:12px;margin:8px 0 4px">最近选股表现</div>';
+  if (!recents || recents.length === 0) {
+    html += '<div style="color:var(--dim);font-size:10px">暂无数据</div>';
+  } else {
+    html += '<table class="stock-table"><thead><tr><th>日期</th><th>策略</th><th>代码</th><th>名称</th><th>买入价</th><th>评分</th><th>T+1</th><th>T+3</th><th>T+5</th></tr></thead><tbody>';
+    for (var i = 0; i < Math.min(recents.length, 20); i++) {
+      var r = recents[i];
+      var c1 = (r.ret_1d || 0) >= 0 ? 'up' : 'down';
+      var c3 = (r.ret_3d || 0) >= 0 ? 'up' : 'down';
+      var c5 = (r.ret_5d || 0) >= 0 ? 'up' : 'down';
+      var sn = r.strategy_key ? (STRATEGIES[r.strategy_key] ? STRATEGIES[r.strategy_key].icon : r.strategy_key) : '-';
+      html += '<tr><td>' + r.run_date + '</td><td>' + sn + '</td><td>' + r.code + '</td><td>' + esc(r.name||'') + '</td>' +
+        '<td>' + (r.pick_price ? r.pick_price.toFixed(2) : '-') + '</td><td>' + (r.score||'-') + '</td>' +
+        '<td class="' + c1 + '">' + (r.ret_1d != null ? (r.ret_1d >= 0 ? '+' : '') + r.ret_1d.toFixed(1) + '%' : '-') + '</td>' +
+        '<td class="' + c3 + '">' + (r.ret_3d != null ? (r.ret_3d >= 0 ? '+' : '') + r.ret_3d.toFixed(1) + '%' : '-') + '</td>' +
+        '<td class="' + c5 + '">' + (r.ret_5d != null ? (r.ret_5d >= 0 ? '+' : '') + r.ret_5d.toFixed(1) + '%' : '-') + '</td></tr>';
+    }
+    html += '</tbody></table>';
+  }
+  document.getElementById('perfRecents').innerHTML = html;
+}
+
+function loadSchedStatus() {
+  fetch('/api/scheduler/status').then(function(r) { return r.json(); }).then(function(d) {
+    document.getElementById('schedRunning').textContent = d.running ? '运行中' : '已停止';
+    document.getElementById('schedRunning').style.color = d.running ? 'var(--green)' : 'var(--red)';
+    document.getElementById('schedLastCheck').textContent = d.last_check || '--';
+    document.getElementById('schedLastOpt').textContent = d.last_optimize || '--';
+  }).catch(function(){});
+}
+
+function checkPerfNow() {
+  fetch('/api/scheduler/check-now').then(function() {
+    setTimeout(loadPerfData, 3000);
+    setTimeout(loadSchedStatus, 3000);
+  });
+}
+
+function optimizeNow() {
+  var url = perfStratKey === 'all' ? '/api/optimize-all' : '/api/optimize/' + perfStratKey;
+  fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+    var msg = perfStratKey === 'all'
+      ? '优化完成: ' + Object.keys(d).filter(function(k) { return !d[k].error; }).length + '/' + Object.keys(d).length + ' 个策略'
+      : (d.error || d.message || '优化完成:' + JSON.stringify(d.changes||d));
+    alert(msg);
+    loadPerfData();
+    loadSchedStatus();
+  }).catch(function(e) { alert('优化失败: ' + e); });
+}</script>
 <!-- 模态弹窗 -->
 <div class="modal-overlay" id="chartModal" onclick="if(event.target===this)closeModal()"
     onmouseenter="modalHovered=true;clearTimeout(leaveTimer)"
@@ -938,11 +847,4 @@ setInterval(tick,1000); tick();
 </div>
 
 </body>
-</html>"""
-
-if __name__ == "__main__":
-    print("\n  A股策略可视化仪表盘 v3")
-    print("  ========================")
-    print("  综合选股 · 四策略一键运行")
-    print("  访问: http://127.0.0.1:5000\n")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+</html>

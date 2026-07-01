@@ -7,7 +7,7 @@ import numpy as np
 import time
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stock_utils import (
+from core.stock_utils import (
     get_client, get_stock_list, get_market_env,
     get_extra_data_batch, calc_technical_indicators,
     detect_volume_price_divergence, calc_atr_stop,
