@@ -448,7 +448,14 @@ function runSingle(key) {
       setTimeout(function(){pw.style.display='none'},2500);
       isRunning = false; document.getElementById('sysStatus').innerHTML = '&#x25cf; 就绪';
     },
-    onError: function(e){ addLog('ERROR: '+e,'err'); btn.classList.remove('running'); isRunning=false; }
+    onError: function(e){
+      addLog('ERROR: '+e,'err'); btn.classList.remove('running');
+      document.getElementById('heroTitle').textContent = '\u26A0 策略执行异常';
+      document.getElementById('heroDesc').textContent = esc(e);
+      document.getElementById('chartBox').style.display = 'none';
+      document.getElementById('sysStatus').innerHTML = '&#x25cf; 就绪';
+      isRunning=false;
+    }
   });
 }
 

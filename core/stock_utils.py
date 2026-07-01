@@ -29,11 +29,21 @@ def get_client():
 # ============================================================
 
 def get_stock_list():
-    """获取沪深A股列表（排除ST/N/C/301/688）"""
+    """获取沪深A股列表（排除ST/N/C/301/688），带重试容错"""
     c = get_client()
-    sh = c.stocks(market=1)
-    sz = c.stocks(market=0)
-    df_all = pd.concat([sh, sz], ignore_index=True)
+
+    sh = _safe_stocks(c, market=1)
+    sz = _safe_stocks(c, market=0)
+
+    if sh is None and sz is None:
+        raise ConnectionError("通达信连接失败，请确认 mootdx 服务可用（通常需要打开通达信客户端或配置行情服务器）")
+
+    dfs = []
+    if sh is not None:
+        dfs.append(sh)
+    if sz is not None:
+        dfs.append(sz)
+    df_all = pd.concat(dfs, ignore_index=True)
 
     codes = []
     for _, s in df_all.iterrows():
@@ -45,6 +55,21 @@ def get_stock_list():
                 and code[:3] != "301"):
             codes.append((code, name))
     return codes
+
+
+def _safe_stocks(client, market, retries=3):
+    """安全获取股票列表，带重试"""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            result = client.stocks(market=market)
+            if result is not None and len(result) > 0:
+                return result
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            _time.sleep(1)
+    return None
 
 
 # ============================================================
