@@ -1,12 +1,24 @@
 """
 A股策略可视化仪表盘 v3 — 综合选股 + 进度动画 + 协调UI
 """
-import json, sys, os, time, threading, queue, re, itertools, io, base64
+import json, sys, os, time, threading, queue, re, itertools, io, base64, math
 from flask import Flask, Response, render_template_string, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.db_manager as db_manager
 import core.scheduler as bg_scheduler
 from core.config import FLASK_HOST, FLASK_PORT
+
+
+def _sanitize_json(obj):
+    """递归替换 NaN / Infinity 为 None，确保 JSON 序列化合法"""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+    return obj
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -449,6 +461,8 @@ def api_kline(code):
         except:
             result["name"] = code
 
+        # NaN 在 JSON 中非法，递归替换为 None → null
+        result = _sanitize_json(result)
         return jsonify(result)
     except Exception as e:
         import traceback; traceback.print_exc()
