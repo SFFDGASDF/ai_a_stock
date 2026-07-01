@@ -612,9 +612,10 @@ function loadKlineData(code, period) {
   var url = '/api/kline/' + code + '?period=' + period;
   fetch(url).then(function(r){if(!r.ok)return r.json().then(function(d){throw new Error(d.error||'请求失败')});return r.json()})
     .then(function(data){
-      renderKlineChart(data);
-      document.getElementById('chartLoader').style.display = 'none';
       document.getElementById('chartContainer').style.display = '';
+      document.getElementById('chartLoader').style.display = 'none';
+      renderKlineChart(data);
+      if (klineChart) klineChart.resize();
       var info = document.getElementById('chartStockInfo');
       var chgColor = data.chg_pct >= 0 ? 'var(--green)' : 'var(--red)';
       info.innerHTML = '<span style="color:' + chgColor + '">' + (data.chg_pct>=0?'+':'') + data.chg_pct.toFixed(2) + '%</span>';
