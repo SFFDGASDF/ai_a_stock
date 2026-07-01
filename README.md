@@ -1,4 +1,4 @@
-# 🐂 AI A-Stock 短线量化分析系统 V4
+# 🐂 AI A-Stock 短线量化分析系统 V4.2
 
 > ⚠️ **风险警示：本系统仅供技术学习与研究参考，不构成任何投资建议。股票投资有风险，入市需谨慎。历史回测与实时扫描数据不代表未来表现。使用者须自行承担全部交易风险。**
 
@@ -9,13 +9,15 @@
 ## 📦 环境依赖
 
 ```bash
-pip install pandas numpy stockstats mootdx requests
+pip install pandas numpy stockstats mootdx requests flask matplotlib mplfinance
 ```
 
 | 库 | 用途 |
 |---|---|
 | `mootdx` (tdxpy) | 通达信 TCP 行情数据（实时行情 + K线） |
 | `stockstats` | 技术指标计算（RSI / MACD / KDJ / BOLL） |
+| `flask` | Web 仪表盘后端 |
+| `matplotlib` + `mplfinance` | K线快照图生成 |
 | `pandas` | 数据处理 |
 | `requests` | HTTP API（东财/腾讯/同花顺） |
 
@@ -31,6 +33,7 @@ ai_a_stock/
 │   ├── volume_price_resonance_v4.py   # 量价共振：放量+主力流入+趋势三确认
 │   └── breakout_strategy.py           # 均线突破：放量突破MA20/MA60启动信号
 │
+├── web_dashboard.py                   # Web 可视化仪表盘（Flask + SSE + Jinja2）
 ├── stock_utils.py                     # 公共模块（行情/指标/换手/资金/情绪/基本面/RPS）
 │
 ├── backtest/
@@ -119,17 +122,19 @@ python web_dashboard.py
 | **单策略运行** | 独立运行动量/超跌/量价共振/均线突破，查看各策略专属结果 |
 | **实时日志流** | SSE (Server-Sent Events) 实时推流策略 stdout，无需刷新页面 |
 | **K线蜡烛动画** | 等待结果时展示动态 K 线图（蜡烛弹跳 + MA 均线描边 + 价格跳动 + 浮动粒子） |
+| **K线快照弹窗** | 点击表格任意股票行弹出 60日K线 + MA均线 + 成交量快照图（mplfinance 渲染） |
 | **进度条** | 四个策略独立彩色进度条，7 步进度精确反馈 |
 | **推荐卡片** | 最终推荐股票独立卡片展示（现价/涨跌/目标价/止损/换手/RPS/PE） |
-| **结果表格** | 完整的候选股排序表格（支持综合/各策略标签切换） |
+| **结果表格** | 完整的候选股排序表格（支持综合/各策略标签切换）+ Hero区联动展示TOP1 |
 | **深色主题** | 专业交易终端风格深色 UI，自适应布局 |
 
 ### 架构说明
 
 - **单文件部署**：`web_dashboard.py` 包含 Flask 后端 + Jinja2 HTML 模板 + 前端 JS
-- **子进程隔离**：每个策略在独立 Python 子进程中运行，`PYTHONIOENCODING=utf-8` 确保中文输出
+- **进程内线程执行**：策略脚本通过 `exec()` 在守护线程中运行，`_LineWriter` 重定向 stdout 实现实时日志流
 - **通用解析器**：`parse_strategy_output` 正则解析所有四种策略的输出格式
 - **综合选股流程**：顺序执行 → 去重合并 → 按评分排序 → 标注来源
+- **K线快照**：`/api/chart/<code>` 端点通过 mplfinance 生成 60日K线图（红涨绿跌 + MA5/10/20 + 成交量），base64 编码返回
 
 ---
 
@@ -219,6 +224,14 @@ python web_dashboard.py
 ---
 
 ## 📋 更新日志
+
+### V4.2 — K线快照 + 引擎优化
+- 新增 **K线快照弹窗**：点击表格股票行弹出 60日K线图（mplfinance 渲染，MA5/10/20 + 成交量）
+- 策略引擎改为**进程内线程执行**（`exec()` + 守护线程），解决 Windows 沙箱 `subprocess.Popen` WinError 5 限制
+- 修复量价共振策略 `ind["upper_shadow"]` KeyError（字段归属修正为 `cand["upper_shadow"]`）
+- 放宽量价共振 vr 阈值（API 数据不可用时阈值从 1.5 降至 0.5）
+- K线弹窗支持 chartCache 缓存（二次悬停即时显示）
+- CSS 过渡动画：遮罩淡入 + 卡片弹簧展开 + 图片渐显
 
 ### V4.1 — Web 仪表盘 + UI 增强
 - 新增 Web 可视化仪表盘（Flask SSE 实时推流）
