@@ -187,6 +187,7 @@ def run_strategy_stream(strategy_key):
             yield emit("error", msg=error_occurred["msg"])
         else:
             result = parse_strategy_output(all_lines)
+            result["stocks"] = result["stocks"][:5]  # 限制单策略最多5只
             with _run_lock: _run_status[strategy_key] = {"running":False,"progress":100,"done":True,"result":result}
             # 异步保存到数据库
             threading.Thread(target=_save_run_to_db, args=(strategy_key, result), daemon=True).start()
@@ -203,6 +204,17 @@ def index():
     with open(template_path, "r", encoding="utf-8") as f:
         html = f.read()
     return render_template_string(html, strategies=STRATEGIES, all_order=ALL_ORDER)
+
+
+@app.route("/ai")
+def ai_analyst():
+    """AI 深度分析页面（支持 URL 参数预填: ?code=600519&name=贵州茅台）"""
+    template_path = os.path.join(BASE_DIR, "web", "templates", "ai_analyst.html")
+    with open(template_path, "r", encoding="utf-8") as f:
+        html = f.read()
+    prefill_code = request.args.get("code", "")
+    prefill_name = request.args.get("name", "")
+    return render_template_string(html, prefill_code=prefill_code, prefill_name=prefill_name)
 
 
 @app.route("/api/run/<strategy_key>")
@@ -251,7 +263,7 @@ def api_run_all():
                 seen.add(s["code"])
                 uniq_stocks.append(s)
         uniq_stocks.sort(key=lambda x: x["score"], reverse=True)
-        merged["stocks"] = uniq_stocks[:60]
+        merged["stocks"] = uniq_stocks[:10]
         merged["recommendations"].sort(key=lambda x: x["score"], reverse=True)
         merged["all_done"] = True
         yield f"data: {json.dumps({'type':'all_done','result':merged},ensure_ascii=False)}\n\n"

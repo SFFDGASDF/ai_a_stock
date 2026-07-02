@@ -23,12 +23,31 @@ def track_pick_performance(pick_id, code, run_date_str):
 
         # 获取选股日之后的 K 线数据（至少需要 15 个交易日）
         bars = client.bars(symbol=code, category=4, offset=30)
-        if bars is None or len(bars) < 5:
+        if bars is None:
             return None
 
-        df = pd.DataFrame(bars)
+        # mootdx 可能返回 datetime 同时是 index 和列名，先修复歧义
+        df = pd.DataFrame(bars) if not isinstance(bars, pd.DataFrame) else bars.copy()
+        try:
+            dup_cols = set(df.index.names) & set(df.columns)
+            for col in dup_cols:
+                if col and col != '':
+                    df = df.drop(columns=[col])
+        except:
+            pass
+        if df.index.name == 'datetime' or 'datetime' in (df.index.names or []):
+            df = df.reset_index()
+        if 'datetime' not in df.columns:
+            for col in df.columns:
+                if 'datetime' in str(col).lower() or 'date' in str(col).lower():
+                    df = df.rename(columns={col: 'datetime'})
+                    break
+
         df['datetime'] = pd.to_datetime(df['datetime'])
         df = df.sort_values('datetime')
+
+        if len(df) < 5:
+            return None
 
         close = df['close'].astype(float)
         high = df['high'].astype(float)

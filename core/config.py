@@ -190,6 +190,16 @@ OPTIMIZE_WEIGHT_DELTA = 3               # 网格搜索步长
 
 
 # ============================================================
+#  AI 多智能体分析
+# ============================================================
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+AI_ANALYST_MODEL = os.getenv("AI_ANALYST_MODEL", "deepseek-v4-pro")
+AI_MAX_DEBATE_ROUNDS = int(os.getenv("AI_MAX_DEBATE_ROUNDS", "1"))
+AI_MAX_RISK_ROUNDS = int(os.getenv("AI_MAX_RISK_ROUNDS", "1"))
+
+
+# ============================================================
 #  日志
 # ============================================================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

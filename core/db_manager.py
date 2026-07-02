@@ -112,7 +112,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS pick_performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pick_id INTEGER NOT NULL,
+            pick_id INTEGER NOT NULL UNIQUE,
             run_date TEXT NOT NULL,
             check_date TEXT NOT NULL,
             ret_1d REAL,
@@ -165,6 +165,33 @@ def init_db():
         )
     """)
 
+    # ==================== AI 多智能体分析记录 ====================
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_analysis_runs (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            name TEXT,
+            trade_date TEXT NOT NULL,
+            rating TEXT,
+            summary TEXT,
+            elapsed_seconds REAL,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            result_json TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_analysis_stages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            stage_name TEXT NOT NULL,
+            stage_order INTEGER,
+            report_text TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (run_id) REFERENCES ai_analysis_runs(id)
+        )
+    """)
+
     # 索引
     c.execute("CREATE INDEX IF NOT EXISTS idx_picks_run ON stock_picks(run_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_picks_code ON stock_picks(code)")
@@ -172,6 +199,8 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_perf_pick ON pick_performance(pick_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_runs_date ON strategy_runs(run_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_runs_strategy ON strategy_runs(strategy_key)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_runs_date ON ai_analysis_runs(trade_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_stages_run ON ai_analysis_stages(run_id)")
 
     conn.commit()
     conn.close()
@@ -616,6 +645,126 @@ def get_ic_analysis(strategy_key, factor_names=None):
 
     results.sort(key=lambda x: abs(x["ic_1d"]), reverse=True)
     return results
+
+
+# ============================================================
+#  AI 多智能体分析
+# ============================================================
+
+def save_ai_run(run_id, symbol, name, trade_date, rating, summary,
+                result_json, stages, elapsed_seconds):
+    """保存一次 AI 分析记录"""
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+        INSERT OR REPLACE INTO ai_analysis_runs (
+            id, symbol, name, trade_date, rating, summary,
+            elapsed_seconds, result_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        run_id, symbol, name, trade_date, rating, summary,
+        elapsed_seconds,
+        json.dumps(result_json, ensure_ascii=False, default=str),
+    ))
+
+    # 保存各阶段报告
+    stage_order_map = {
+        "market": 1, "sentiment": 2, "fundamentals": 3,
+        "debate": 4, "trader": 5, "risk": 6, "pm": 7,
+    }
+    for stage_name, report_text in stages.items():
+        c.execute("""
+            INSERT INTO ai_analysis_stages (run_id, stage_name, stage_order, report_text)
+            VALUES (?, ?, ?, ?)
+        """, (
+            run_id, stage_name,
+            stage_order_map.get(stage_name, 99),
+            report_text[:10000],
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_ai_runs(limit=20):
+    """获取历史 AI 分析记录"""
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id, symbol, name, trade_date, rating, summary,
+               elapsed_seconds, created_at
+        FROM ai_analysis_runs
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_ai_report(run_id):
+    """获取单次 AI 分析完整报告（含各阶段）"""
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM ai_analysis_runs WHERE id = ?", (run_id,))
+    run = c.fetchone()
+    if not run:
+        conn.close()
+        return None
+
+    c.execute("""
+        SELECT stage_name, stage_order, report_text
+        FROM ai_analysis_stages
+        WHERE run_id = ?
+        ORDER BY stage_order
+    """, (run_id,))
+    stages = c.fetchall()
+
+    result = dict(run)
+    if result.get("result_json"):
+        try:
+            result["result_json"] = json.loads(result["result_json"])
+        except Exception:
+            pass
+    result["stages"] = [dict(s) for s in stages]
+
+    conn.close()
+    return result
+
+
+def get_ai_latest_by_codes(codes: list) -> dict:
+    """批量获取多只股票的最新 AI 分析结果 (rating + summary)。
+    返回 {code: {rating, summary, trade_date, run_id, elapsed_seconds}} 字典。
+    """
+    if not codes:
+        return {}
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ",".join(["?" for _ in codes])
+    c.execute(f"""
+        SELECT r.symbol, r.name, r.rating, r.summary, r.trade_date, r.id as run_id, r.elapsed_seconds
+        FROM ai_analysis_runs r
+        INNER JOIN (
+            SELECT symbol, MAX(created_at) as max_created
+            FROM ai_analysis_runs
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+        ) latest ON r.symbol = latest.symbol AND r.created_at = latest.max_created
+    """, codes)
+    rows = c.fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        d = dict(row)
+        code = d.pop("symbol", "")
+        # normalize code — strip suffix
+        code = code.split(".")[0] if "." in code else code
+        result[code] = d
+    return result
 
 
 # 初始化

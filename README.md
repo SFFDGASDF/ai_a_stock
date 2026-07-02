@@ -1,4 +1,4 @@
-# AI A-Stock 短线量化分析系统 V4.3
+# AI A-Stock 短线量化分析系统 V4.4
 
 > # ⛔ 严禁用于实盘交易 ⛔
 >
@@ -8,7 +8,7 @@
 > **股市有风险，投资须谨慎。量化模型无法预测市场，历史回测不代表未来表现。
 > 使用者如擅自将本工具用于实盘交易，须自行承担全部资金损失及法律后果。**
 
-基于 Python 的 A 股 T+1 隔日交易选股系统。内置**四策略体系** + Web 可视化仪表盘 + 统一回测框架 + **策略进化引擎**（数据库记录、绩效追踪、因子IC分析、权重自动优化）。
+基于 Python 的 A 股 T+1 隔日交易选股系统。内置**四策略体系** + Web 可视化仪表盘 + 统一回测框架 + **AI 多智能体深度分析** + **策略进化引擎**（数据库记录、绩效追踪、因子IC分析、权重自动优化）。
 
 ---
 
@@ -27,6 +27,7 @@ pip install -r requirements.txt
 | `pandas` / `numpy` | 数据处理与数值计算 |
 | `scipy` | Spearman 秩相关 / 因子IC分析 |
 | `requests` | HTTP API（东财/腾讯/同花顺） |
+| `openai` | DeepSeek API 调用（AI 多智能体分析） |
 
 ---
 
@@ -44,15 +45,20 @@ ai_a_stock/
 │   ├── config.py                      #   配置中心（所有可调参数）
 │   ├── logging_config.py              #   统一日志
 │   ├── stock_utils.py                 #   行情 / 技术指标 / 资金 / 情绪 / RPS
-│   ├── db_manager.py                  #   SQLite 数据库（选股入库 + 绩效 + 权重）
+│   ├── db_manager.py                  #   SQLite 数据库（选股入库 + 绩效 + 权重 + AI分析）
 │   ├── performance_tracker.py         #   T+N 绩效追踪与统计
 │   ├── strategy_optimizer.py          #   因子IC分析 + 权重自动优化
-│   └── scheduler.py                   #   后台调度引擎（定时追踪 + 自动优化）
+│   ├── scheduler.py                   #   后台调度引擎（定时追踪 + 自动优化）
+│   ├── llm_client.py                  #   DeepSeek LLM 客户端（超时重试）
+│   ├── ai_analyst_data.py             #   AI 分析数据层（K线+指标融合查询）
+│   └── ai_analyst_pipeline.py         #   AI 多智能体分析管线（7阶段）
 │
 ├── web/                               # —— Web 应用
 │   ├── dashboard.py                   #   Flask 后端（SSE + API + K线图）
+│   ├── ai_analyst_api.py              #   AI 分析 SSE 流式 API
 │   └── templates/
-│       └── dashboard.html             #   仪表盘前端模板
+│       ├── dashboard.html             #   仪表盘前端模板
+│       └── ai_analyst.html            #   AI 深度分析页面模板
 │
 ├── strategies/                        # —— 四策略
 │   ├── momentum_v4.py                 #   动量策略：追涨幅3-7%的强势股
@@ -115,6 +121,43 @@ python backtest/backtest_framework.py  # 回测验证
 | **结果表格** | 候选股排序表格 + 标签切换 + Hero区联动TOP1 |
 | **绩效面板** | 各策略胜率/收益率/盈亏比 + 因子IC分析 + 最近表现 |
 | **进化引擎** | 数据库自动记录 → 绩效追踪 → 因子分析 → 权重优化 |
+
+---
+
+## AI 多智能体深度分析
+
+### 快速使用
+
+1. 在仪表盘任意股票行点击 **🧠 AI** 按钮，或直接访问 `/ai?code=600519&name=贵州茅台`
+2. 系统自动运行 7 阶段多智能体分析管线，SSE 流式展示进度
+
+### 分析管线（7 阶段）
+
+| # | 智能体 | 职责 | 数据源 |
+|---|--------|------|--------|
+| 1 | 市场分析师 | K线形态、均线系统、RSI/MACD/布林/ATR 综合研判 | mootdx K线 + 技术指标 |
+| 2 | 情绪分析师 | 大盘涨跌比、涨停/炸板统计、市场温度 | 东财情绪 API |
+| 3 | 基本面分析师 | PE/PB/市值/换手率交叉验证 | 东财 push2his API |
+| 4 | 辩论桌 | 多空双方围绕关键分歧点正反辩论 | 前三阶段报告融合 |
+| 5 | 交易员 | 综合多空观点形成具体操作建议 | 辩论结论 + 技术面 |
+| 6 | 风险管理 | 识别潜在风险、计算合理止损位 | 全量数据交叉核验 |
+| 7 | 投资经理 | 最终评级（Buy/Overweight/Hold/Sell）+ 投资摘要 | 所有阶段输出综合 |
+
+### 配置
+
+```bash
+# .env 中配置 DeepSeek API
+DEEPSEEK_API_KEY=your-deepseek-api-key      # 必填
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+AI_ANALYST_MODEL=deepseek-v4-pro
+AI_MAX_DEBATE_ROUNDS=1
+```
+
+> ⚠️ API Key 仅存储在 `.env` 文件中，该文件已加入 `.gitignore`，不会被提交到仓库。
+
+### 分析结果回填
+
+AI 分析完成后，评级（Buy/Overweight/Hold/Sell）会自动回填到策略选股列表的 "AI评级" 列中，鼠标悬停可预览摘要，点击跳转完整分析报告。
 
 ---
 
@@ -256,6 +299,17 @@ python backtest/backtest_framework.py  # 回测验证
 ---
 
 ## 更新日志
+
+### V4.4 — AI 多智能体分析
+
+- 新增 **AI 多智能体深度分析**：7 阶段分析管线（市场→情绪→基本面→辩论→交易→风控→PM）
+- 新增 SSE 流式展示 AI 分析全过程，实时查看各智能体输出
+- 新增 AI 分析结果自动回填策略选股列表（Buy/Overweight/Hold/Sell 评级）
+- 新增 `core/llm_client.py`：DeepSeek API 客户端（120s 超时 + 指数退避重试）
+- 新增 `core/ai_analyst_data.py`：融合 K线+11项技术指标的一次性查询（减少 10+ 次 API 调用至 2 次）
+- **修复** 绩效追踪器 `track_pick_performance()` 因 mootdx DataFrame datetime 歧义静默失败的问题
+- **修复** `pick_performance` 表缺少 UNIQUE 约束导致 `INSERT OR REPLACE` 可能重复
+- 仪表盘新增 🧠 AI 按钮直达深度分析页面 + K线交互增强（分时/周K/月K）
 
 ### V4.3 — 策略进化 + 工程化重构
 

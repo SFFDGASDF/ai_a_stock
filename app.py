@@ -15,7 +15,11 @@ from core.logging_config import logger
 
 # 导入 Web 应用和调度器
 from web.dashboard import app
+from web.ai_analyst_api import ai_bp
 import core.scheduler as bg_scheduler
+
+# 注册 AI 分析蓝图
+app.register_blueprint(ai_bp)
 
 
 def main():
