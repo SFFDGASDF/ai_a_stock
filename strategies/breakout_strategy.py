@@ -105,21 +105,6 @@ print(f"    数据: 换手{len(extra_data)}只  基本面{len(fund_data)}只")
 
 # ===== Step 5: 技术面深度分析 =====
 print(f"\n  [5/7] 技术面深度分析...")
-global_chg20 = []
-for ci in range(0, min(500, len(codes)), 80):
-    batch = codes[ci:ci + 80]
-    try:
-        quotes = client.quotes(symbol=batch)
-        if quotes is None or len(quotes) == 0:
-            continue
-        for _, q in quotes.iterrows():
-            price = float(q.get("price", 0) or 0)
-            prev_close = float(q.get("last_close", 0) or 0)
-            if price > 0 and prev_close > 0:
-                global_chg20.append((price / prev_close - 1) * 100)
-    except:
-        pass
-
 results = []
 
 for idx, cand in enumerate(candidates):
@@ -159,13 +144,13 @@ for idx, cand in enumerate(candidates):
         pb = fund.get("pb", 0)
         total_mv = fund.get("total_mv", 0)
 
-        if pe < 0 or pe > 200:
+        if pe != 0 and (pe < 0 or pe > 200):
             continue
         if 0 < total_mv < 2_000_000_000:
             continue
 
         # === 真实RPS ===
-        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, global_chg20, None)
+        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, None, None)
 
         # 量价背离
         close_s = df["close"].astype(float)
@@ -308,11 +293,21 @@ for idx, cand in enumerate(candidates):
             "stop_pct": stop_pct, "stop_price": stop_price,
             "rps20": rps20, "pe": pe, "pb": pb, "total_mv": total_mv,
             "breakout_ma20": breakout_ma20, "breakout_ma60": breakout_ma60,
+            "chg_20d": ind["chg_20d"],
         })
     except:
         pass
 
 results.sort(key=lambda x: x["score"], reverse=True)
+
+# === V1.1: 基于候选池修正真实RPS20 ===
+if results:
+    all_chg20 = [r["chg_20d"] for r in results]
+    n = len(all_chg20)
+    for r in results:
+        rank = sum(1 for x in all_chg20 if x <= r["chg_20d"])
+        r["rps20"] = round(rank / n * 100, 1)
+
 print(f"    分析完成: {len(results)} 只确认突破")
 
 # ===== Step 6: 补全名称 =====

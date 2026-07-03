@@ -155,23 +155,6 @@ ind_momentum = get_industry_momentum()
 # ===== Step 5: 技术面深度分析 =====
 print(f"\n  [5/7] 技术面深度分析...")
 
-# 预计算全市场RPS基准（V4新增）
-print("    预计算RPS基准...")
-global_chg20 = []
-for ci in range(0, min(500, len(codes)), 80):
-    batch = codes[ci:ci + 80]
-    try:
-        quotes = client.quotes(symbol=batch)
-        if quotes is None or len(quotes) == 0:
-            continue
-        for _, q in quotes.iterrows():
-            price = float(q.get("price", 0) or 0)
-            prev_close = float(q.get("last_close", 0) or 0)
-            if price > 0 and prev_close > 0:
-                global_chg20.append((price / prev_close - 1) * 100)
-    except:
-        pass
-
 results = []
 
 for idx, cand in enumerate(candidates):
@@ -197,7 +180,8 @@ for idx, cand in enumerate(candidates):
         total_mv = fund.get("total_mv", 0)
 
         # 过滤条件：PE<0(亏损)或PE>200、PB>10、市值<20亿
-        if pe < 0 or pe > 200:
+        # pe=0表示数据不可用，跳过过滤
+        if pe != 0 and (pe < 0 or pe > 200):
             continue
         if pb > 10:
             continue
@@ -205,7 +189,7 @@ for idx, cand in enumerate(candidates):
             continue
 
         # === V4: 真实RPS ===
-        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, global_chg20, None)
+        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, None, None)
 
         # 量价背离检测
         close_s = df["close"].astype(float)
@@ -427,11 +411,21 @@ for idx, cand in enumerate(candidates):
             "ma5_slope": ind["ma5_slope"], "atr14": ind["atr14"],
             "stop_pct": stop_pct, "stop_price": stop_price,
             "pe": pe, "pb": pb, "total_mv": total_mv,
+            "chg_20d": ind["chg_20d"],
         })
     except Exception as e:
         pass
 
 results.sort(key=lambda x: x["score"], reverse=True)
+
+# === V4.1: 基于候选池修正真实RPS20 ===
+if results:
+    all_chg20 = [r["chg_20d"] for r in results]
+    n = len(all_chg20)
+    for r in results:
+        rank = sum(1 for x in all_chg20 if x <= r["chg_20d"])
+        r["rps20"] = round(rank / n * 100, 1)
+
 print(f"    分析完成: {len(results)} 只（已过滤基本面不合格）")
 
 # ===== Step 6: 补全名称 =====

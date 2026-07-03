@@ -122,22 +122,6 @@ candidates = filtered[:200]
 # ===== Step 5: 技术面深度分析 =====
 print(f"\n  [5/7] 技术面深度分析 ({len(candidates)} 只)...")
 
-# RPS基准
-global_chg20 = []
-for ci in range(0, min(500, len(codes)), 80):
-    batch = codes[ci:ci + 80]
-    try:
-        quotes = client.quotes(symbol=batch)
-        if quotes is None or len(quotes) == 0:
-            continue
-        for _, q in quotes.iterrows():
-            price = float(q.get("price", 0) or 0)
-            prev_close = float(q.get("last_close", 0) or 0)
-            if price > 0 and prev_close > 0:
-                global_chg20.append((price / prev_close - 1) * 100)
-    except:
-        pass
-
 results = []
 
 for idx, cand in enumerate(candidates):
@@ -168,7 +152,7 @@ for idx, cand in enumerate(candidates):
             continue
 
         # === V4: 真实RPS ===
-        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, global_chg20, None)
+        rps20, rps60 = calc_true_rps(code, ind["chg_20d"], None, None, None)
 
         # VIP检查（API数据不可用时放宽vr阈值）
         vr_threshold = 0.5 if len(extra_data) == 0 else 0.8
@@ -325,11 +309,21 @@ for idx, cand in enumerate(candidates):
             "amount": cand["amount"],
             "stop_pct": stop_pct, "stop_price": stop_price,
             "rps20": rps20, "pe": pe, "pb": pb, "total_mv": total_mv,
+            "chg_20d": ind["chg_20d"],
         })
     except:
         pass
 
 results.sort(key=lambda x: x["score"], reverse=True)
+
+# === V4.1: 基于候选池修正真实RPS20 ===
+if results:
+    all_chg20 = [r["chg_20d"] for r in results]
+    n = len(all_chg20)
+    for r in results:
+        rank = sum(1 for x in all_chg20 if x <= r["chg_20d"])
+        r["rps20"] = round(rank / n * 100, 1)
+
 print(f"    分析完成: {len(results)} 只通过共振检查")
 
 # ===== Step 6: 补全名称 =====

@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import core.db_manager as db_manager
 import core.scheduler as bg_scheduler
 from core.config import FLASK_HOST, FLASK_PORT
+from web.ai_analyst_api import ai_bp
 
 
 def _sanitize_json(obj):
@@ -21,6 +22,7 @@ def _sanitize_json(obj):
     return obj
 
 app = Flask(__name__)
+app.register_blueprint(ai_bp)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STRATEGIES_DIR = os.path.join(BASE_DIR, "strategies")
 
@@ -255,14 +257,16 @@ def api_run_all():
                             merged["done_count"] = idx + 1
                             yield f"data: {json.dumps({'type':'strategy_done','key':key,'done_count':idx+1,'total':4,'result':r},ensure_ascii=False)}\n\n"
                     except: pass
-        # 去重、排序合并结果
+        # 去重、排序合并结果（strip空格防止不可见字符）
         seen = set()
         uniq_stocks = []
         for s in merged["stocks"]:
-            if s["code"] not in seen:
-                seen.add(s["code"])
+            code_clean = str(s.get("code","")).strip()
+            if code_clean and code_clean not in seen:
+                seen.add(code_clean)
+                s["code"] = code_clean  # 统一格式
                 uniq_stocks.append(s)
-        uniq_stocks.sort(key=lambda x: x["score"], reverse=True)
+        uniq_stocks.sort(key=lambda x: x.get("score", 0), reverse=True)
         merged["stocks"] = uniq_stocks[:10]
         merged["recommendations"].sort(key=lambda x: x["score"], reverse=True)
         merged["all_done"] = True

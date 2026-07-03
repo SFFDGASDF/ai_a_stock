@@ -86,13 +86,12 @@ def get_market_env(codes_list=None, sample_n=500):
     flat_count = 0
     total_count = 0
 
-    # 三大指数
+    # 三大指数（mootdx 需要 sh/sz 前缀区分指数和个股）
     indices = {"上证指数": "sh000001", "深证成指": "sz399001", "创业板指": "sz399006"}
     index_status = {}
     for idx_name, idx_code in indices.items():
         try:
-            raw = idx_code[2:]
-            q = c.quotes(symbol=[raw])
+            q = c.quotes(symbol=[idx_code])
             if q is not None and len(q) > 0:
                 row = q.iloc[0]
                 price = float(row.get("price", 0) or 0)
@@ -159,6 +158,32 @@ def get_market_env(codes_list=None, sample_n=500):
 _extra_data_cache = {}
 _extra_data_cache_date = None
 
+# 东财API Session（复用TCP连接，抗断续断开）
+_em_session = None
+
+def _get_em_session():
+    """获取/创建东财API Session（带预热）"""
+    global _em_session
+    if _em_session is None:
+        _em_session = requests.Session()
+        _em_session.headers.update(HEADERS)
+    return _em_session
+
+def _em_fetch(params, retries=5, delay=2.0):
+    """东财API统一请求：Session复用 + 5次重试 + 指数退避"""
+    session = _get_em_session()
+    for attempt in range(retries):
+        try:
+            r = session.get("https://push2his.eastmoney.com/api/qt/clist/get",
+                           params=params, timeout=15)
+            d = r.json()
+            return d
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+            else:
+                raise
+
 def _safe_float(val):
     """安全转float，处理 '-' 和 None"""
     if val in ("-", "", None):
@@ -171,7 +196,6 @@ def _safe_float(val):
 def _fetch_market_extra_data(market_id, fs_val, label):
     """拉取单个市场全部股票的换手率+大单净量+量比（多页）"""
     data = {}
-    url = "https://push2his.eastmoney.com/api/qt/clist/get"
     for pn in range(1, 50):
         params = {
             "pn": str(pn), "pz": "100",
@@ -182,8 +206,7 @@ def _fetch_market_extra_data(market_id, fs_val, label):
             "fields": "f8,f12,f62,f184",
         }
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            d = r.json()
+            d = _em_fetch(params)
             if d.get("data") is None:
                 break
             items = d["data"].get("diff") or []
@@ -246,122 +269,106 @@ def get_extra_data_batch(codes):
 
 def get_limit_up_sentiment():
     """
-    获取当日市场情绪指标
-    返回 dict: {
-        'limit_up_count': int,    # 涨停家数
-        'limit_down_count': int,  # 跌停家数
-        'broken_board_count': int, # 炸板家数
-        'broken_rate': float,     # 炸板率 (0-100)
-        'max_conn_board': int,    # 最高连板数
-        'sentiment_score': float, # 市场温度 (0-100)
-        'sentiment_label': str,   # 情绪标签
-    }
+    获取当日市场情绪指标（各API独立容错+重试）
     """
     result = {
         "limit_up_count": 0, "limit_down_count": 0,
         "broken_board_count": 0, "broken_rate": 0,
-        "max_conn_board": 0, "sentiment_score": 50,
-        "sentiment_label": "中性",
+        "sentiment_score": 50, "sentiment_label": "[中性]",
     }
 
-    try:
-        # 用 clist 获取涨停/跌停家数（从缓存数据中统计）
-        # 同时拉取涨停板专题数据
-        url = "https://push2his.eastmoney.com/api/qt/clist/get"
-        
-        # 涨停股池
-        limit_up_codes = set()
-        broken_codes = set()
-        
-        for pn in range(1, 10):
-            params = {
-                "pn": str(pn), "pz": "100",
-                "po": "1", "np": "1",
-                "fltt": "2", "invt": "2",
-                "fid": "f3",
-                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-                "fields": "f2,f3,f12",
-            }
-            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            d = r.json()
+    base_params = {"pn": "1", "pz": "100", "np": "1", "fltt": "2", "invt": "2", "fid": "f3"}
+
+    def _fetch_api(params):
+        """用 _em_fetch 拉取 items 列表"""
+        try:
+            d = _em_fetch(params)
             if d.get("data") is None:
-                break
+                return []
             items = d["data"].get("diff") or []
+            return items
+        except Exception:
+            return []
+
+    # ---- 1. 涨停数量 (po=1 涨幅从高到低) ----
+    try:
+        limit_up_codes = set()
+        for pn in range(1, 10):
+            params = {**base_params, "pn": str(pn), "po": "1",
+                      "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                      "fields": "f2,f3,f12"}
+            items = _fetch_api(params)
             if not items:
                 break
             for item in items:
                 chg = _safe_float(item.get("f3"))
-                code = str(item.get("f12", ""))
                 if chg >= 9.5:
-                    limit_up_codes.add(code)
-                elif chg <= -9.5:
-                    result["limit_down_count"] += 1
-            # 如果这一页最低涨幅都<9.5%，后面的更不会有涨停
-            if items:
-                last_chg = _safe_float(items[-1].get("f3"))
-                if last_chg < 9.5:
-                    break
-            time.sleep(0.1)
-        
-        result["limit_up_count"] = len(limit_up_codes)
-        
-        # 炸板数据：从炸板股池获取
-        for pn in range(1, 5):
-            params2 = {
-                "pn": str(pn), "pz": "100",
-                "po": "1", "np": "1",
-                "fltt": "2", "invt": "2",
-                "fid": "f3",
-                "fs": "b:DLZGJJ+tc:?",
-                "fields": "f12,f14",
-            }
-            try:
-                r2 = requests.get(url, params=params2, headers=HEADERS, timeout=10)
-                d2 = r2.json()
-                if d2.get("data") is None or not d2["data"].get("diff"):
-                    break
-                result["broken_board_count"] += len(d2["data"]["diff"])
-            except:
+                    limit_up_codes.add(str(item.get("f12", "")))
+            last_chg = _safe_float(items[-1].get("f3"))
+            if last_chg < 9.5:
                 break
             time.sleep(0.1)
-        
-        # 计算炸板率
-        total_board = result["limit_up_count"] + result["broken_board_count"]
-        if total_board > 0:
-            result["broken_rate"] = result["broken_board_count"] / total_board * 100
-        
-        # 计算市场温度 (0-100)
-        # 温度 = f(涨跌比) * 0.4 + f(涨停数) * 0.3 + (100-炸板率) * 0.3
-        if _extra_data_cache:
-            up_count = sum(1 for code, data in _extra_data_cache.items() 
-                          if code in limit_up_codes)
-            # 涨跌比从market_env来，这里简化
-            up_down_score = 50  # 默认50
-        
-        # 涨停温度
-        lu_score = min(100, result["limit_up_count"] * 2)
-        
-        # 炸板温度（炸板率越低越好）
-        broken_score = max(0, 100 - result["broken_rate"] * 2)
-        
-        result["sentiment_score"] = min(100, lu_score * 0.4 + broken_score * 0.3 + 50 * 0.3)
-        
-        # 情绪标签
-        s = result["sentiment_score"]
-        if s >= 75:
-            result["sentiment_label"] = "🔥 火爆"
-        elif s >= 60:
-            result["sentiment_label"] = "☀ 偏暖"
-        elif s >= 40:
-            result["sentiment_label"] = "☁ 中性"
-        elif s >= 25:
-            result["sentiment_label"] = "❄ 偏冷"
-        else:
-            result["sentiment_label"] = "🧊 冰点"
-        
-    except Exception as e:
+        result["limit_up_count"] = len(limit_up_codes)
+    except Exception:
         pass
-    
+
+    # ---- 2. 跌停数量 (po=0 跌幅从高到低) ----
+    try:
+        limit_down_count = 0
+        for pn in range(1, 10):
+            params = {**base_params, "pn": str(pn), "po": "0",
+                      "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                      "fields": "f2,f3,f12"}
+            items = _fetch_api(params)
+            if not items:
+                break
+            for item in items:
+                if _safe_float(item.get("f3")) <= -9.5:
+                    limit_down_count += 1
+            last_chg = _safe_float(items[-1].get("f3"))
+            if last_chg > -9.5:
+                break
+            time.sleep(0.1)
+        result["limit_down_count"] = limit_down_count
+    except Exception:
+        pass
+
+    # ---- 3. 炸板数据 (东财BK0504接口不稳定，MARK为N/A) ----
+    # 该接口暂时无法稳定连接，炸板率暂不可用
+    # 待接口恢复后可启用: fs="b:BK0504"
+
+    # ---- 4. 计算炸板率 ----
+    total_board = result["limit_up_count"] + result["broken_board_count"]
+    if total_board > 0:
+        result["broken_rate"] = result["broken_board_count"] / total_board * 100
+
+    # ---- 5. 市场温度 (0-100): 涨停+跌停 双维度 ----
+    lu_count = result["limit_up_count"]
+    ld_count = result["limit_down_count"]
+
+    # 涨停映射: 0家→0分, 50家→75分(饱和)
+    lu_score = min(100, lu_count * 1.5)
+
+    # 跌停惩罚: 0家→0惩罚, 20家→60惩罚, 30家→90惩罚
+    ld_penalty = min(95, ld_count * 3)
+
+    # 综合: 涨停贡献70%, 跌停惩罚占30%
+    sentiment = lu_score * 0.7 + max(0, 100 - ld_penalty) * 0.3
+    result["sentiment_score"] = round(max(5, min(100, sentiment)))
+
+    # ---- 6. 情绪标签 ----
+    s = result["sentiment_score"]
+    if s >= 75:
+        result["sentiment_label"] = "[火爆]"
+    elif s >= 60:
+        result["sentiment_label"] = "[偏暖]"
+    elif s >= 40:
+        result["sentiment_label"] = "[中性]"
+    elif s >= 25:
+        result["sentiment_label"] = "[偏冷]"
+    else:
+        result["sentiment_label"] = "[冰点]"
+
     return result
 
 
@@ -376,7 +383,6 @@ _fundamental_cache_date = None
 def _fetch_market_fundamental(market_id, fs_val):
     """拉取单市场PE/PB/市值（多页）"""
     data = {}
-    url = "https://push2his.eastmoney.com/api/qt/clist/get"
     for pn in range(1, 50):
         params = {
             "pn": str(pn), "pz": "100",
@@ -387,8 +393,7 @@ def _fetch_market_fundamental(market_id, fs_val):
             "fields": "f9,f12,f20,f23,f115",
         }
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            d = r.json()
+            d = _em_fetch(params)
             if d.get("data") is None:
                 break
             items = d["data"].get("diff") or []

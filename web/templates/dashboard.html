@@ -151,14 +151,26 @@ body{font-family:'Microsoft YaHei',-apple-system,sans-serif;background:var(--bg)
 .act-btn.chart-btn:hover{border-color:var(--accent);color:var(--accent)}
 
 /* AI 评级徽章 */
-.ai-rating-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;text-decoration:none;position:relative}
-.ai-rating-badge:hover{transform:scale(1.08);box-shadow:0 2px 10px rgba(0,0,0,.3)}
+.ai-rating-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;text-decoration:none;position:relative}
+.ai-rating-badge:hover{transform:scale(1.05);box-shadow:0 3px 12px rgba(0,0,0,.35)}
 .ai-rating-badge.Buy,.ai-rating-badge.Overweight{background:rgba(0,210,160,.15);color:var(--green);border:1px solid rgba(0,210,160,.3)}
 .ai-rating-badge.Hold{background:rgba(254,202,87,.12);color:var(--yellow);border:1px solid rgba(254,202,87,.3)}
 .ai-rating-badge.Underweight,.ai-rating-badge.Sell{background:rgba(255,107,107,.12);color:var(--red);border:1px solid rgba(255,107,107,.3)}
-.ai-rating-tooltip{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:10px;font-weight:400;color:var(--text);white-space:normal;max-width:240px;z-index:50;box-shadow:0 6px 20px rgba(0,0,0,.4);text-align:left;line-height:1.45;pointer-events:none}
+.ai-rating-tooltip{display:none;position:fixed;background:linear-gradient(135deg,#141e2a,#1a2838);border:1px solid rgba(168,85,247,.35);border-radius:10px;padding:14px 16px;font-size:11px;font-weight:400;color:var(--text);white-space:normal;width:300px;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.55),0 0 0 1px rgba(168,85,247,.1);text-align:left;line-height:1.55;pointer-events:none}
+.ai-rating-tooltip .tt-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,.08)}
+.ai-rating-tooltip .tt-rating{font-size:14px;font-weight:700;color:#fff}
+.ai-rating-tooltip .tt-date{font-size:10px;color:var(--dim)}
+.ai-rating-tooltip .tt-meta{display:flex;gap:12px;margin-bottom:8px;font-size:10.5px;color:var(--accent)}
+.ai-rating-tooltip .tt-meta span{background:rgba(72,219,251,.08);padding:2px 8px;border-radius:4px}
+.ai-rating-tooltip .tt-label{display:block;font-size:9px;color:var(--purple);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px;font-weight:700}
+.ai-rating-tooltip .tt-summary{font-size:10.5px;color:#c8d6e5;line-height:1.6;margin-bottom:8px;word-break:break-word}
+.ai-rating-tooltip .tt-thesis{font-size:10.5px;color:#a0b4c8;line-height:1.6;word-break:break-word}
+.ai-rating-tooltip .tt-hint{font-size:9px;color:var(--purple);margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06);opacity:.8}
 .ai-rating-badge:hover .ai-rating-tooltip{display:block}
-.ai-rating-none{color:var(--dim);font-size:10px}
+/* 表格单元格允许tooltip溢出 */
+.stock-table td{overflow:visible}
+.stock-table td:has(.ai-rating-badge){overflow:visible}
+.ai-rating-none{color:var(--dim);font-size:11px}
 
 /* AI 分析区块 */
 .ai-section{background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(99,102,241,.04));border:1px solid rgba(168,85,247,.25);border-radius:14px;padding:20px;margin-top:6px;animation:fadeIn .5s ease}
@@ -401,6 +413,18 @@ function showResult(key) {
     document.getElementById('aiSection').style.display = 'none';
     return;
   }
+  // 前端兜底去重（综合tab），防止SSE传输/解析问题
+  if (key === 'all') {
+    var seen = {}, deduped = [];
+    for (var si = 0; si < data.stocks.length; si++) {
+      var s = data.stocks[si];
+      var c = String(s.code || '').trim();
+      if (!c || seen[c]) continue;
+      seen[c] = true;
+      deduped.push(s);
+    }
+    data.stocks = deduped;
+  }
   document.getElementById('stockTable').style.display = '';
   var tbody = document.getElementById('stockTbody');
   tbody.innerHTML = data.stocks.map(function(s,i){
@@ -440,7 +464,12 @@ function showResult(key) {
 }
 
 function fetchAIData(stocks) {
-  var codes = stocks.map(function(s){ return s.code; });
+  var codes = []; var seen2 = {};
+  for (var i2 = 0; i2 < stocks.length; i2++) {
+    var c2 = String(stocks[i2].code || '').trim();
+    if (c2 && !seen2[c2]) { seen2[c2] = true; codes.push(c2); }
+  }
+  if (!codes.length) return;
   fetch('/api/ai-latest-by-codes', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -452,23 +481,64 @@ function fetchAIData(stocks) {
 
 function injectAIBadges(aiData) {
   var ratingIcons = {Buy:'🟢', Overweight:'🟢', Hold:'🟡', Underweight:'🟠', Sell:'🔴'};
+  var RATING_CN = {Buy:'强烈推荐', Overweight:'增持', Hold:'持有', Underweight:'减持', Sell:'卖出'};
   Object.keys(aiData).forEach(function(code){
     var cell = document.getElementById('ai-col-'+code);
     if (!cell) return;
     var ai = aiData[code];
     var rating = ai.rating || '—';
+    var ratingCN = RATING_CN[rating] || rating;
     var icon = ratingIcons[rating] || '';
     var summary = ai.summary || '';
+    var thesis = ai.thesis || '';
     var name = ai.name || '';
     var tradeDate = ai.trade_date || '';
-    var runId = ai.run_id || '';
-    // Truncate summary for tooltip
-    var shortSummary = summary.length > 80 ? summary.substring(0,80)+'...' : summary;
+    var priceTarget = ai.price_target || '';
+    var timeHorizon = ai.time_horizon || '';
+
+    // 构建 tooltip HTML
+    var tooltipHtml = '';
+    if (summary || thesis) {
+      tooltipHtml = '<span class="ai-rating-tooltip">';
+      tooltipHtml += '<div class="tt-head"><span class="tt-rating">'+icon+' '+ratingCN+'</span><span class="tt-date">'+esc(tradeDate)+'</span></div>';
+      if (priceTarget || timeHorizon) {
+        tooltipHtml += '<div class="tt-meta">';
+        if (priceTarget) tooltipHtml += '<span>目标价: ¥'+esc(priceTarget)+'</span>';
+        if (timeHorizon) tooltipHtml += '<span>周期: '+esc(timeHorizon)+'</span>';
+        tooltipHtml += '</div>';
+      }
+      if (summary) tooltipHtml += '<div class="tt-summary"><span class="tt-label">交易结论</span>'+esc(summary)+'</div>';
+      if (thesis) tooltipHtml += '<div class="tt-thesis"><span class="tt-label">投资论点</span>'+esc(thesis)+'</div>';
+      tooltipHtml += '<div class="tt-hint">🖱 点击查看完整AI研报</div>';
+      tooltipHtml += '</span>';
+    }
+
     cell.innerHTML =
       '<a class="ai-rating-badge '+esc(rating)+'" href="/ai?code='+encodeURIComponent(code)+'&name='+encodeURIComponent(name)+'" target="_blank" onclick="event.stopPropagation()" title="点击查看完整AI分析">'+
-        icon + ' ' + rating +
-        (summary ? '<span class="ai-rating-tooltip"><b>'+esc(name||code)+'</b> '+esc(tradeDate)+'<br>'+esc(shortSummary)+'</span>' : '')+
+        icon + ' ' + ratingCN + tooltipHtml +
       '</a>';
+
+    // 动态定位 tooltip
+    var badge = cell.querySelector('.ai-rating-badge');
+    var tip = cell.querySelector('.ai-rating-tooltip');
+    if (badge && tip) {
+      badge.addEventListener('mouseenter', function(){
+        var rect = badge.getBoundingClientRect();
+        var tw = 300;
+        var left = rect.left + rect.width/2 - tw/2;
+        if (left < 8) left = 8;
+        if (left + tw > window.innerWidth - 8) left = window.innerWidth - tw - 8;
+        var top = rect.top - 8;
+        var tipH = tip.offsetHeight || 140;
+        if (top - tipH < 8) {
+          top = rect.bottom + 8;
+        } else {
+          top = top - tipH;
+        }
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+      });
+    }
   });
 }
 

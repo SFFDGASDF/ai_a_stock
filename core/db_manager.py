@@ -737,8 +737,8 @@ def get_ai_report(run_id):
 
 
 def get_ai_latest_by_codes(codes: list) -> dict:
-    """批量获取多只股票的最新 AI 分析结果 (rating + summary)。
-    返回 {code: {rating, summary, trade_date, run_id, elapsed_seconds}} 字典。
+    """批量获取多只股票的最新 AI 分析结果。
+    返回 {code: {rating, summary, thesis, price_target, time_horizon, trade_date, run_id, elapsed_seconds}} 字典。
     """
     if not codes:
         return {}
@@ -746,7 +746,7 @@ def get_ai_latest_by_codes(codes: list) -> dict:
     c = conn.cursor()
     placeholders = ",".join(["?" for _ in codes])
     c.execute(f"""
-        SELECT r.symbol, r.name, r.rating, r.summary, r.trade_date, r.id as run_id, r.elapsed_seconds
+        SELECT r.symbol, r.name, r.rating, r.summary, r.trade_date, r.id as run_id, r.elapsed_seconds, r.result_json
         FROM ai_analysis_runs r
         INNER JOIN (
             SELECT symbol, MAX(created_at) as max_created
@@ -761,8 +761,17 @@ def get_ai_latest_by_codes(codes: list) -> dict:
     for row in rows:
         d = dict(row)
         code = d.pop("symbol", "")
-        # normalize code — strip suffix
         code = code.split(".")[0] if "." in code else code
+        # 从 result_json 中提取 price_target / time_horizon / thesis
+        rj = d.pop("result_json", None)
+        if rj:
+            try:
+                rj_obj = json.loads(rj) if isinstance(rj, str) else rj
+                d["price_target"] = rj_obj.get("price_target", "")
+                d["time_horizon"] = rj_obj.get("time_horizon", "")
+                d["thesis"] = rj_obj.get("thesis", "")
+            except Exception:
+                pass
         result[code] = d
     return result
 

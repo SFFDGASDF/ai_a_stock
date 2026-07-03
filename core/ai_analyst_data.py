@@ -321,7 +321,7 @@ def get_verified_snapshot(
 
 
 def get_fundamentals(symbol: str) -> str:
-    """获取股票基本面信息（通过通达信 finance 接口）。
+    """获取股票基本面信息（通过通达信 finance 接口 + 东方财富 PE/PB/市值）。
 
     Args:
         symbol: 股票代码
@@ -329,27 +329,68 @@ def get_fundamentals(symbol: str) -> str:
     code = _normalize_symbol(symbol)
     client = _get_client()
 
+    lines = [
+        f"# 基本面数据: {symbol} ({code})",
+    ]
+
+    # ---- 1. 东方财富 PE/PB/市值（更可靠）----
+    try:
+        import requests as _req
+        url = "https://push2his.eastmoney.com/api/qt/clist/get"
+        market_code = "1" if code.startswith(("6", "9")) else "0"
+        fs_val = f"m:{market_code}+t:2,m:{market_code}+t:23" if code.startswith("6") else f"m:0+t:6,m:0+t:80"
+        params = {
+            "pn": "1", "pz": "100",
+            "po": "1", "np": "1",
+            "fltt": "2", "invt": "2",
+            "fid": "f12",
+            "fs": fs_val,
+            "fields": "f9,f12,f20,f23,f115",
+        }
+        r = _req.get(url, params=params, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }, timeout=10)
+        d = r.json()
+        items = d.get("data", {}).get("diff", [])
+        for item in items:
+            if str(item.get("f12", "")) == code:
+                pe = item.get("f9")
+                pb = item.get("f23")
+                total_mv = item.get("f20")
+                lines.append(f"# 来源: 东方财富 (实时估值数据)")
+                if pe is not None and float(pe) != 0:
+                    lines.append(f"PE(市盈率): {pe}")
+                else:
+                    lines.append(f"PE(市盈率): 数据不可用")
+                if pb is not None and float(pb) != 0:
+                    lines.append(f"PB(市净率): {pb}")
+                if total_mv is not None and float(total_mv) != 0:
+                    mv_yi = float(total_mv) / 1e8
+                    lines.append(f"总市值: {mv_yi:.1f}亿")
+                break
+    except Exception:
+        pass
+
+    # ---- 2. 通达信 finance 接口（补充数据）----
     with _tdx_lock:
         try:
             finance = client.finance(symbol=code)
         except Exception as e:
-            return f"UNAVAILABLE: 通达信 finance 接口调用失败: {e}"
+            lines.append(f"# 通达信 finance 接口调用失败: {e}")
+            return "\n".join(lines)
 
     if finance is None or (isinstance(finance, pd.DataFrame) and finance.empty):
-        return f"UNAVAILABLE: 通达信未返回 {symbol} 的基本面数据"
-
-    if isinstance(finance, pd.DataFrame):
-        lines = [
-            f"# Fundamentals for {symbol} ({code})",
-            f"# Source: 通达信 finance",
-        ]
-        # 转置显示：行=字段, 列=值
+        lines.append(f"# 通达信未返回额外数据")
+    elif isinstance(finance, pd.DataFrame):
+        lines.append(f"# 来源: 通达信 finance (公司基本信息)")
         for col in finance.columns:
             val = finance[col].iloc[0] if len(finance) > 0 else "N/A"
             lines.append(f"{col}: {val}")
-        return "\n".join(lines)
+    else:
+        lines.append(str(finance))
 
-    return str(finance)
+    return "\n".join(lines)
 
 
 def get_market_data(
