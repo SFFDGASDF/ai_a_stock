@@ -14,12 +14,9 @@ from core.config import FLASK_HOST, FLASK_PORT, FLASK_DEBUG
 from core.logging_config import logger
 
 # 导入 Web 应用和调度器
+# 注意：ai_bp 蓝图已在 web/dashboard.py 中注册，此处无需重复注册
 from web.dashboard import app
-from web.ai_analyst_api import ai_bp
 import core.scheduler as bg_scheduler
-
-# 注册 AI 分析蓝图
-app.register_blueprint(ai_bp)
 
 
 def main():
